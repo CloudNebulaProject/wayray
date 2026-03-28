@@ -1,0 +1,15 @@
+[book]
+authors = ["WayRay Contributors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "WayRay - Thin Client Wayland Compositor"
+description = "A modern SunRay-like thin client system built on Wayland and Rust"
+
+[build]
+build-dir = "build"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/wayray/wayray"
