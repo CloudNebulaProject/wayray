@@ -145,6 +145,34 @@ Frame encoding adapts to content type and network conditions:
 4. Client captures microphone, encodes to Opus, sends to server
 5. Server feeds decoded audio into PipeWire virtual source
 
+## Scope Boundary: What WayRay Owns
+
+WayRay is a compositor, not a desktop environment or login system.
+
+**WayRay owns:**
+- Wayland compositor (rendering, protocol, encoding, transport)
+- Session lifecycle (active, suspended, resumed, destroyed)
+- Token-to-session binding
+- Pluggable WM protocol
+
+**WayRay does NOT own:**
+- User authentication (PAM, LDAP, Kerberos)
+- User environment (home dirs, mounts, shell, env vars)
+- Desktop environment (WayRay cannot host GNOME/KDE -- they are compositors)
+
+**The desktop experience** is composed from independent Wayland clients:
+- Window manager via `wayray_wm_manager_v1` protocol (floating, tiling, custom)
+- Panel/taskbar (waybar, etc.) via `wlr-layer-shell`
+- App launcher (fuzzel, wofi) via `wlr-layer-shell`
+- Notification daemon (mako, fnott) via `wlr-layer-shell`
+- Any Wayland or X11 application
+
+**Login flow** is handled by an external session launcher (like greetd for Sway):
+1. Token arrives, no session exists
+2. Session launcher creates user environment (PAM, mounts)
+3. Greeter (a Wayland client) authenticates the user
+4. Session launcher starts user's configured session (WM, panel, apps)
+
 ## Comparison with SunRay
 
 | Feature | SunRay | WayRay |
@@ -153,8 +181,11 @@ Frame encoding adapts to content type and network conditions:
 | Compositor | X server (Xnewt) | Wayland (Smithay) |
 | Client Hardware | Purpose-built DTU | Any Linux/macOS/Windows device |
 | Session Mobility | Smart card | Pluggable tokens (smart card, NFC, software) |
+| Login Screen | dtlogin (X11 client) | wayray-greeter (Wayland client) |
+| Desktop | CDE/GNOME on X11 | Composable: pluggable WM + panel + launcher |
 | Audio | Custom ALP channel | Opus over QUIC |
-| USB Forwarding | Custom | USB/IP or usbredir |
+| USB Forwarding | Custom | Userspace over QUIC |
 | Encryption | Optional ALP encryption | Mandatory TLS 1.3 |
 | Multi-server | Failover groups | Distributed session registry |
+| Platform | Solaris | illumos + Linux |
 | Client OS | Proprietary RTOS | Native application |

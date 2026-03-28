@@ -43,6 +43,9 @@ WayRay consists of four main components:
 - **Headless-first**: No hard dependency on GPU, DRM, or Linux-specific subsystems
 - **illumos + Linux**: Portable core, platform-specific backends behind feature flags
 - **Pluggable Window Management**: External WM process via custom Wayland protocol (River-inspired two-phase transaction model). Ships with built-in floating WM as default.
+- **Compositor, not a DE**: Cannot run GNOME/KDE (they ARE compositors). Desktop composed from independent Wayland clients (WM + panel + launcher + apps). Like Sway's ecosystem.
+- **Greeter as Wayland client**: Login screen is a regular Wayland app, not a separate compositor. External session launcher handles PAM/user env (like greetd for Sway).
+- **WayRay does NOT own**: user auth, home dir mounting, PAM, user environment setup. Those are the host system's job. WayRay owns the compositor session and token binding.
 - QUIC over TCP for network transport (multiplexing, 0-RTT reconnect)
 - PixmanRenderer for headless server (no GPU needed), GlesRenderer when GPU available
 - Damage-tracked differential frame encoding

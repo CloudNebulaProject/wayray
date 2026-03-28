@@ -102,18 +102,33 @@
 - Session storage: in-memory with optional persistence (SeaORM + SQLite)
 - Session timeout and cleanup policies
 
-### 3.2 Authentication
-- Token-based session identification (smart card ID, badge, or software token)
-- PAM integration for user authentication
-- Session-token binding in session store
+### 3.2 Greeter and Session Launch
+- Define session launcher interface (events over Unix socket: session_requested, session_authenticated, session_logout)
+- Implement reference session launcher (`wayray-session-launcher`) that:
+  - Receives "new session needed" events from WayRay
+  - Creates user environment (delegates to PAM, system tools)
+  - Starts WayRay compositor session for the user
+  - Launches greeter as first Wayland client
+- Implement reference greeter (`wayray-greeter`) as a Wayland client:
+  - Login form (username + password)
+  - Authenticates via PAM through session launcher
+  - On success, session launcher starts user's configured session (WM, panel, apps)
+  - Greeter exits
+- User session config: `~/.config/wayray/session.toml` (WM, panel, launcher, autostart apps)
+- Support `wlr-layer-shell` protocol for panels, launchers, notification daemons
 
-### 3.3 Hot-Desking (Session Mobility)
+### 3.3 Token-Based Session Identity
+- Token-based session identification (smart card ID, badge, or software token)
+- Session-token binding in session store
+- WayRay does NOT own authentication -- delegates to session launcher / PAM
+
+### 3.4 Hot-Desking (Session Mobility)
 - Token insertion triggers session lookup across server pool
 - Session reconnection: rebind existing session to new client endpoint
 - Session disconnect: unbind from client, keep session running
 - Sub-second reconnection target (< 500ms)
 
-### 3.4 Multi-Server Support
+### 3.5 Multi-Server Support
 - Server discovery protocol (mDNS or custom)
 - Session registry: which sessions live on which servers
 - Cross-server session redirect
