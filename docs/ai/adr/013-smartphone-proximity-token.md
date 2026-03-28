@@ -52,13 +52,42 @@ WayRay Client (BLE scanner):
   5. If multiple tokens: nearest (highest RSSI) wins
 ```
 
-### NFC -- Complementary
+### NFC -- Complementary (and Charging Pad Mode)
 
 Phone tap on NFC reader for explicit authentication:
 - Quick deliberate action (tap to connect)
 - Works as fallback when BLE is disabled
 - Can trigger initial token provisioning
-- Very short range (~4cm) -- no proximity tracking
+- Very short range (~4cm) -- no proximity tracking, clean binary signal
+
+**Wireless charging pad as card reader:** In high-security or dense office deployments, the client's NFC reader can be embedded in (or placed next to) a Qi wireless charging pad. The phone on the pad is simultaneously charging and authenticating -- exactly mimicking a smart card in a reader slot. NFC provides the crisp insert/remove semantics (present = attached, lifted = detached) without RSSI ambiguity. The companion app responds to NFC with the session token via HCE (Host Card Emulation on Android) or Core NFC (iOS).
+
+**Combined NFC + BLE mode:** For deployments that want both:
+- NFC: immediate attach when phone placed on pad (desk-distance, deliberate)
+- BLE: sustained heartbeat confirming phone is still present (survives brief NFC interrupts)
+- NFC absence + BLE absence: detach (phone physically removed from area)
+
+This gives precise control -- some offices want centimeter-range "phone on pad" behavior, others want meter-range "phone in pocket" behavior. Same `TokenProvider` trait, deployment configuration picks the mode:
+
+```toml
+# /etc/wayray/token.toml
+
+[proximity]
+# "ble" = walk-up proximity (meter range)
+# "nfc" = charging pad / tap (centimeter range)
+# "ble+nfc" = NFC for attach, BLE for heartbeat
+# "ble|nfc" = either can attach independently
+mode = "nfc"
+
+[ble]
+rssi_threshold = -70    # dBm
+attach_delay = 2        # seconds
+detach_delay = 10       # seconds
+
+[nfc]
+# No thresholds needed -- NFC is binary (present/absent)
+detach_delay = 3        # seconds grace period for brief lifts
+```
 
 ### UWB (Ultra-Wideband) -- Future
 
