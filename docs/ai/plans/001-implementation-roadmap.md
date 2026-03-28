@@ -3,7 +3,7 @@
 ## Phase 0: Foundation (Weeks 1-2)
 
 ### 0.1 Project Structure
-- Set up Cargo workspace with four crates: `wayray-server`, `wayray-client`, `wayray-protocol`, `wayray-ctl`
+- Set up Cargo workspace with four crates: `wrsrvd`, `wrclient`, `wayray-protocol`, `wradm`
 - Configure shared dependencies, feature flags, CI (Linux + illumos)
 - Set up tracing/logging infrastructure with miette error handling
 - Smithay with `default-features = false` + portable features only in core
@@ -30,8 +30,8 @@
 - Version negotiation and capability exchange
 
 ### 1.2 QUIC Transport Layer
-- Implement QUIC server (quinn) in wayray-server
-- Implement QUIC client (quinn) in wayray-client
+- Implement QUIC server (quinn) in wrsrvd
+- Implement QUIC client (quinn) in wrclient
 - Stream mapping:
   - Stream 0: Control channel (session mgmt, capabilities)
   - Stream 1: Display channel (frame updates, damage regions)
@@ -52,7 +52,7 @@
 ## Phase 2: Client Viewer (Weeks 5-7)
 
 ### 2.1 Display Client
-- Implement wayray-client as a standalone application
+- Implement wrclient as a standalone application
 - Use winit + wgpu for cross-platform display
 - Frame decoding pipeline: receive -> decompress -> decode -> upload to GPU -> display
 - Double-buffered rendering with VSync
@@ -78,7 +78,7 @@
 - Generate Rust bindings via wayland-scanner
 
 ### 2.5.2 WM Protocol Server (in compositor)
-- Implement WM global in wayray-server
+- Implement WM global in wrsrvd
 - Window lifecycle events (new, closed, properties)
 - Manage phase: receive policy decisions, send configures
 - Render phase: apply positions/z-order atomically
@@ -91,7 +91,7 @@
 - Yields to external WM on connect
 
 ### 2.5.4 Example Tiling WM
-- Ship a reference tiling WM as a separate binary (`wayray-wm-tiling`)
+- Ship a reference tiling WM as a separate binary (`wr-wm-tiling`)
 - Demonstrates the protocol for third-party WM developers
 - Basic BSP tiling with keyboard-driven focus
 
@@ -104,12 +104,12 @@
 
 ### 3.2 Greeter and Session Launch
 - Define session launcher interface (events over Unix socket: session_requested, session_authenticated, session_logout)
-- Implement reference session launcher (`wayray-session-launcher`) that:
+- Implement reference session launcher (`wrsessd`) that:
   - Receives "new session needed" events from WayRay
   - Creates user environment (delegates to PAM, system tools)
   - Starts WayRay compositor session for the user
   - Launches greeter as first Wayland client
-- Implement reference greeter (`wayray-greeter`) as a Wayland client:
+- Implement reference greeter (`wrlogin`) as a Wayland client:
   - Login form (username + password)
   - Authenticates via PAM through session launcher
   - On success, session launcher starts user's configured session (WM, panel, apps)
@@ -160,7 +160,7 @@
 ## Phase 5: Production Hardening (Weeks 14-17)
 
 ### 5.1 Platform-Specific Backends
-- Linux: DRM/KMS backend for running wayray-server on hardware (optional, feature-gated)
+- Linux: DRM/KMS backend for running wrsrvd on hardware (optional, feature-gated)
 - Linux: Multi-GPU support via MultiRenderer
 - Linux: Session management via logind/libseat
 - illumos: Custom input backend for `/dev/kbd` + `/dev/mouse` (local console use)
@@ -187,7 +187,7 @@
 ## Phase 6: Management & Operations (Weeks 16-20)
 
 ### 6.1 Administration
-- CLI tool: `wayray-ctl` for server/session management
+- CLI tool: `wradm` for server/session management
 - REST API for external integration
 - Session monitoring: active sessions, resource usage, network stats
 

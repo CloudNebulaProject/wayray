@@ -171,7 +171,7 @@ The user sees: "Connect to Customer D" → windows appear. The gateway handles V
 │    │ ForeignWindow protocol (Unix socket or QUIC)           │
 │    │                                                        │
 │  ┌─┴────────────────────────────────────────────────────┐   │
-│  │  Protocol Gateway Service (wayray-gateway)            │   │
+│  │  Protocol Gateway Service (wrgw)            │   │
 │  │                                                       │   │
 │  │  ┌─────────────┐  ┌───────────────┐  ┌───────────┐  │   │
 │  │  │ VPN Client  │  │ RDP Client    │  │ Surface   │  │   │
@@ -273,25 +273,25 @@ name = "Customer D"
 auto_workspace = true
 ```
 
-### Gateway Management via wayray-ctl
+### Gateway Management via wradm
 
 ```bash
 # List configured gateways
-wayray-ctl gateway list
+wradm gateway list
 
 # Connect to a gateway
-wayray-ctl gateway connect customer-d
+wradm gateway connect customer-d
 
 # Status of active gateways
-wayray-ctl gateway status
+wradm gateway status
 # customer-d: connected (VPN: up, RDP: 3 windows active)
 # customer-b: connected (WayRay federation: 2 apps)
 
 # Disconnect
-wayray-ctl gateway disconnect customer-d
+wradm gateway disconnect customer-d
 
 # Import a gateway profile (shared by team lead / IT admin)
-wayray-ctl gateway import customer-d.toml
+wradm gateway import customer-d.toml
 ```
 
 ### Network Isolation
@@ -375,14 +375,14 @@ Putting it all together:
         → Workspace 1: "My Desktop" with email, chat, docs
 
 09:00 - Customer B maintenance window
-        → wayray-ctl gateway connect customer-b
+        → wradm gateway connect customer-b
         → VPN tunnel establishes automatically
         → Workspace 2 appears: "Customer B"
         → SAP GUI and monitoring console open seamlessly
         → Fix the issue, close the ticket in customer's Jira
 
 10:30 - Disconnect Customer B
-        → wayray-ctl gateway disconnect customer-b
+        → wradm gateway disconnect customer-b
         → VPN torn down, workspace closes
         → Back to Workspace 1
 

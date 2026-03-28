@@ -13,14 +13,14 @@
 
 ```bash
 # List active sessions
-wayray-ctl session list
+wradm session list
 
 # View session details
-wayray-ctl session info <session-id>
+wradm session info <session-id>
 
 # Terminate a session
-wayray-ctl session kill <session-id>
+wradm session kill <session-id>
 
 # Set session timeout
-wayray-ctl session set-timeout <session-id> 48h
+wradm session set-timeout <session-id> 48h
 ```

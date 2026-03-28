@@ -116,7 +116,7 @@ Wayland apps → Smithay compositor → PixmanRenderer → CPU buffer
 
 ### Tier 2: Loopback Optimization (Local Server+Client)
 
-When wayray-server and wayray-client run on the same machine, skip encoding entirely:
+When wrsrvd and wrclient run on the same machine, skip encoding entirely:
 
 1. Server renders to shared memory ring buffer (`shm_open` + `mmap`)
 2. Client reads framebuffers directly from shared memory
@@ -125,7 +125,7 @@ When wayray-server and wayray-client run on the same machine, skip encoding enti
 
 ```
 Wayland apps → Smithay compositor → PixmanRenderer → shared memory
-    → wayray-client (local) → fbdev or X11 SHM → screen
+    → wrclient (local) → fbdev or X11 SHM → screen
 ```
 
 Performance: sub-millisecond frame latency (vs 5-30ms with encode/decode), near-zero CPU overhead for transport, pixel-perfect quality.

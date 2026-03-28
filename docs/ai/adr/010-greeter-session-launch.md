@@ -93,7 +93,7 @@ This is analogous to:
 - Sway: greetd + gtkgreet/regreet
 - GNOME: GDM + gnome-shell (but GDM IS a compositor; our greeter is a client)
 
-We provide a **reference session launcher** (`wayray-session-launcher`) but the interface is a simple protocol/hook so admins can replace it with their own.
+We provide a **reference session launcher** (`wrsessd`) but the interface is a simple protocol/hook so admins can replace it with their own.
 
 ### The Greeter
 
@@ -103,7 +103,7 @@ A Wayland client application that:
 - On success, signals the session launcher to proceed with user session setup
 - Exits
 
-We ship a reference greeter (`wayray-greeter`) but any Wayland client implementing the greeter protocol works. Community can build GTK, Qt, or TUI-based greeters.
+We ship a reference greeter (`wrlogin`) but any Wayland client implementing the greeter protocol works. Community can build GTK, Qt, or TUI-based greeters.
 
 ### The User Session (Desktop Experience)
 
@@ -113,8 +113,8 @@ After authentication, the session launcher starts the user's configured environm
 # Example: ~/.config/wayray/session.toml
 
 # Window manager (connects via wayray_wm_manager_v1 protocol)
-wm = "wayray-wm-floating"
-# wm = "wayray-wm-tiling"
+wm = "wr-wm-floating"
+# wm = "wr-wm-tiling"
 # wm = "/usr/local/bin/my-custom-wm"
 
 # Panel (layer-shell Wayland client)

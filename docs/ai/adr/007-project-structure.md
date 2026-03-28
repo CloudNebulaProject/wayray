@@ -13,7 +13,7 @@ WayRay consists of multiple binaries and shared libraries. We need a project str
 wayray/
 ├── Cargo.toml              # Workspace root
 ├── crates/
-│   ├── wayray-server/      # Wayland compositor + frame encoder + network server
+│   ├── wrsrvd/      # Wayland compositor + frame encoder + network server
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs
@@ -22,7 +22,7 @@ wayray/
 │   │       ├── network/     # QUIC server, session management
 │   │       └── audio/       # PipeWire integration
 │   │
-│   ├── wayray-client/      # Remote viewer + input capture + decoder
+│   ├── wrclient/      # Remote viewer + input capture + decoder
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs
@@ -40,7 +40,7 @@ wayray/
 │   │       ├── codec.rs     # Serialization/deserialization
 │   │       └── version.rs   # Protocol versioning
 │   │
-│   └── wayray-ctl/         # CLI management tool
+│   └── wradm/         # CLI management tool
 │       ├── Cargo.toml
 │       └── src/
 │           └── main.rs
@@ -54,7 +54,7 @@ wayray/
 - `crates/` directory keeps workspace root clean
 - Protocol crate ensures server and client agree on wire format at compile time
 - Server and client have completely different dependency trees (smithay vs wgpu)
-- `wayray-ctl` as separate binary avoids bloating server/client with admin dependencies
+- `wradm` as separate binary avoids bloating server/client with admin dependencies
 - Integration tests at workspace root can spin up server + client together
 
 ## Consequences

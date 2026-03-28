@@ -4,7 +4,7 @@
 
 ## Configuration File
 
-WayRay client reads configuration from `wayray-client.toml`:
+WayRay client reads configuration from `wrclient.toml`:
 
 ```toml
 [connection]

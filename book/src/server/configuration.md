@@ -4,7 +4,7 @@
 
 ## Configuration File
 
-WayRay server reads configuration from `wayray-server.toml`:
+WayRay server reads configuration from `wrsrvd.toml`:
 
 ```toml
 [server]

@@ -352,7 +352,7 @@ Scenario 3 in practice:
 ```
 Company B admin:
   1. Publishes app "internal-tool" for federation
-  2. Creates invite: wayray-ctl federation invite \
+  2. Creates invite: wradm federation invite \
        --app internal-tool \
        --peer wayray.companya.com \
        --user jdoe@companya.com \
@@ -360,7 +360,7 @@ Company B admin:
 
 Company A user (jdoe):
   1. Sits at their normal WayRay terminal
-  2. Opens federation panel or runs: wayray-ctl federation accept <invite-url>
+  2. Opens federation panel or runs: wradm federation accept <invite-url>
   3. OIDC authentication confirms jdoe's identity to Company B
   4. Company B's "internal-tool" appears as a window in jdoe's desktop
   5. Window has "Trusted" border and "Company B" origin badge

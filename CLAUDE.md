@@ -25,10 +25,10 @@ WayRay is a modern reimplementation of Oracle/Sun's SunRay thin client architect
 
 WayRay consists of four main components:
 
-1. **wayray-server** (compositor) - Smithay-based Wayland compositor that runs applications, captures framebuffers, and transmits them to clients. Exposes a pluggable WM protocol.
-2. **wayray-client** (viewer) - Lightweight display client that decodes frames, renders them locally, captures input, and sends it to the server
+1. **wrsrvd** (compositor) - Smithay-based Wayland compositor that runs applications, captures framebuffers, and transmits them to clients. Exposes a pluggable WM protocol.
+2. **wrclient** (viewer) - Lightweight display client that decodes frames, renders them locally, captures input, and sends it to the server
 3. **wayray-protocol** - Shared protocol definitions for the WayRay wire protocol over QUIC
-4. **wayray-ctl** - CLI management tool for server/session administration
+4. **wradm** - CLI management tool for server/session administration
 
 ## Documentation
 
@@ -53,6 +53,19 @@ WayRay consists of four main components:
 - Userspace USB forwarding over QUIC (not kernel USB/IP, for portability)
 - Audio: PipeWire (Linux) or PulseAudio (illumos/Linux) behind trait abstraction
 - `shm_open` fallback when `memfd_create` unavailable (illumos portability)
+
+## Binary Names (illumos-style)
+
+| Binary | Purpose |
+|--------|---------|
+| `wrsrvd` | Server compositor daemon |
+| `wrclient` | Client viewer |
+| `wradm` | Administration CLI (`zoneadm`/`svcadm` pattern) |
+| `wrlogin` | Greeter / login screen (`dtlogin` heritage) |
+| `wrsessd` | Session launcher daemon |
+| `wrgw` | Protocol gateway service |
+| `wr-wm-floating` | Default floating WM |
+| `wr-wm-tiling` | Reference tiling WM |
 
 ## Conventions
 

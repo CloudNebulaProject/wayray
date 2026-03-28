@@ -7,7 +7,7 @@
 ### Client can't connect to server
 - Check that UDP port 4433 is open
 - Verify TLS certificates are correct
-- Check server logs: `RUST_LOG=wayray=debug wayray-server`
+- Check server logs: `RUST_LOG=wayray=debug wrsrvd`
 
 ### High latency / poor responsiveness
 - Check network latency: `ping <server>`

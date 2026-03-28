@@ -1,11 +1,11 @@
-# wayray-ctl Reference
+# wradm Reference
 
 > This page will be expanded as the management tool is implemented.
 
 ## Commands
 
 ```
-wayray-ctl
+wradm
   session
     list              List all sessions
     info <id>         Show session details

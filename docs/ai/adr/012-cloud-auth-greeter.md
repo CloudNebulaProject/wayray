@@ -90,7 +90,7 @@ The greeter is the natural integration point -- it runs before any user context 
 
 ### Pre-Auth Ephemeral Session
 
-The greeter itself needs a Wayland session to display the login UI, but no user is authenticated yet. The session launcher creates a minimal **ephemeral session** running as a service user (e.g., `wayray-greeter`):
+The greeter itself needs a Wayland session to display the login UI, but no user is authenticated yet. The session launcher creates a minimal **ephemeral session** running as a service user (e.g., `wrlogin`):
 - Limited compositor session (no user apps, no shell access)
 - Only the greeter client is allowed to connect
 - Destroyed after authentication succeeds or times out
@@ -259,7 +259,7 @@ What changes is how the greeter *arrives* at that identity.
 Rather than hardcoding auth methods, the greeter supports **auth plugins**:
 
 ```
-wayray-greeter
+wrlogin
   ├── auth-local        (username + password → PAM)
   ├── auth-oidc         (OAuth/OIDC device code or auth code)
   ├── auth-smartcard    (PC/SC → certificate → PAM or IdP)

@@ -17,7 +17,7 @@ WayRay exposes metrics for monitoring:
 WayRay uses structured logging via the `tracing` crate. Configure log levels via `RUST_LOG`:
 
 ```bash
-RUST_LOG=wayray=info wayray-server   # Standard
-RUST_LOG=wayray=debug wayray-server  # Verbose
-RUST_LOG=wayray=trace wayray-server  # Everything
+RUST_LOG=wayray=info wrsrvd   # Standard
+RUST_LOG=wayray=debug wrsrvd  # Verbose
+RUST_LOG=wayray=trace wrsrvd  # Everything
 ```

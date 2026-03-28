@@ -16,21 +16,21 @@ cargo build
 cargo build --release
 
 # Build only the server
-cargo build -p wayray-server
+cargo build -p wrsrvd
 
 # Build only the client
-cargo build -p wayray-client
+cargo build -p wrclient
 
 # Run tests
 cargo test --workspace
 
 # Run with logging
-RUST_LOG=wayray=debug cargo run -p wayray-server
+RUST_LOG=wayray=debug cargo run -p wrsrvd
 ```
 
 ## Feature Flags
 
-### wayray-server
+### wrsrvd
 
 | Feature | Default | Description |
 |---------|---------|-------------|
@@ -39,7 +39,7 @@ RUST_LOG=wayray=debug cargo run -p wayray-server
 | `xwayland` | no | X11 application support |
 | `vaapi` | no | Hardware video encoding |
 
-### wayray-client
+### wrclient
 
 | Feature | Default | Description |
 |---------|---------|-------------|
@@ -53,7 +53,7 @@ RUST_LOG=wayray=debug cargo run -p wayray-server
 During development, run the WayRay server nested inside your existing desktop using the Winit backend:
 
 ```bash
-cargo run -p wayray-server -- --backend winit
+cargo run -p wrsrvd -- --backend winit
 ```
 
 This opens a window on your desktop that acts as the WayRay display. No need for a separate TTY.
@@ -62,8 +62,8 @@ This opens a window on your desktop that acts as the WayRay display. No need for
 
 ```bash
 # Terminal 1: Start server
-cargo run -p wayray-server -- --backend winit --listen 127.0.0.1:4433
+cargo run -p wrsrvd -- --backend winit --listen 127.0.0.1:4433
 
 # Terminal 2: Start client
-cargo run -p wayray-client -- --server 127.0.0.1:4433 --token dev
+cargo run -p wrclient -- --server 127.0.0.1:4433 --token dev
 ```

@@ -8,7 +8,7 @@ The simplest token type. A UUID is generated and stored on the client.
 
 ```bash
 # Generate a new software token
-wayray-client token generate
+wrclient token generate
 # Output: Token: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
@@ -18,10 +18,10 @@ Requires a PC/SC compatible smart card reader.
 
 ```bash
 # List available smart card readers
-wayray-client token list-readers
+wrclient token list-readers
 
 # Use smart card for session identity
-wayray-client --token-type smartcard --server <host>:<port>
+wrclient --token-type smartcard --server <host>:<port>
 ```
 
 ## NFC Tokens
@@ -30,5 +30,5 @@ Requires an NFC reader.
 
 ```bash
 # Use NFC for session identity
-wayray-client --token-type nfc --server <host>:<port>
+wrclient --token-type nfc --server <host>:<port>
 ```

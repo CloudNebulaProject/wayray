@@ -5,7 +5,7 @@
 ## Basic Connection
 
 ```bash
-wayray-client --server <host>:<port> --token <token>
+wrclient --server <host>:<port> --token <token>
 ```
 
 ## Connection Troubleshooting

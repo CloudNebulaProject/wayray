@@ -4,7 +4,7 @@
 
 WayRay consists of four components:
 
-### wayray-server
+### wrsrvd
 
 The server is a Wayland compositor built on [Smithay](https://github.com/Smithay/smithay). It:
 
@@ -17,7 +17,7 @@ The server is a Wayland compositor built on [Smithay](https://github.com/Smithay
 
 The server runs on Linux and can operate headless (no GPU required) or with GPU acceleration.
 
-### wayray-client
+### wrclient
 
 The client is a lightweight viewer application that:
 
@@ -34,7 +34,7 @@ The client runs on Linux, with macOS and Windows support planned.
 
 A shared library defining the wire protocol between server and client. This ensures both sides agree on message formats at compile time.
 
-### wayray-ctl
+### wradm
 
 A command-line tool for administering WayRay servers:
 

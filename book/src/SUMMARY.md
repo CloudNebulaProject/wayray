@@ -32,7 +32,7 @@
 
 # Administration
 
-- [wayray-ctl Reference](./admin/wayray-ctl.md)
+- [wradm Reference](./admin/wradm.md)
 - [Security](./admin/security.md)
 - [Monitoring](./admin/monitoring.md)
 - [Troubleshooting](./admin/troubleshooting.md)

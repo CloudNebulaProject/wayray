@@ -43,15 +43,15 @@ cd wayray
 cargo build --release
 
 # Binaries are in target/release/
-ls target/release/wayray-server target/release/wayray-client target/release/wayray-ctl
+ls target/release/wrsrvd target/release/wrclient target/release/wradm
 ```
 
 ### Docker
 
 ```dockerfile
 # Server image available
-docker pull wayray/wayray-server:latest
+docker pull wayray/wrsrvd:latest
 
 # Or build locally
-docker build -t wayray-server -f docker/server.Dockerfile .
+docker build -t wrsrvd -f docker/server.Dockerfile .
 ```

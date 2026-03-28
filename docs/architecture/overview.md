@@ -181,7 +181,7 @@ WayRay is a compositor, not a desktop environment or login system.
 | Compositor | X server (Xnewt) | Wayland (Smithay) |
 | Client Hardware | Purpose-built DTU | Any Linux/macOS/Windows device |
 | Session Mobility | Smart card | Pluggable tokens (smart card, NFC, software) |
-| Login Screen | dtlogin (X11 client) | wayray-greeter (Wayland client) |
+| Login Screen | dtlogin (X11 client) | wrlogin (Wayland client) |
 | Desktop | CDE/GNOME on X11 | Composable: pluggable WM + panel + launcher |
 | Audio | Custom ALP channel | Opus over QUIC |
 | USB Forwarding | Custom | Userspace over QUIC |

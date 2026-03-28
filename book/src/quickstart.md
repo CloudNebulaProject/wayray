@@ -7,7 +7,7 @@ This guide gets you running a WayRay server and connecting a client in minutes.
 WayRay requires TLS for all connections. For development, generate self-signed certificates:
 
 ```bash
-wayray-ctl cert generate --output ./certs
+wradm cert generate --output ./certs
 ```
 
 This creates `certs/server.crt` and `certs/server.key`.
@@ -15,7 +15,7 @@ This creates `certs/server.crt` and `certs/server.key`.
 ## 2. Start the Server
 
 ```bash
-wayray-server \
+wrsrvd \
   --cert ./certs/server.crt \
   --key ./certs/server.key \
   --listen 0.0.0.0:4433 \
@@ -29,7 +29,7 @@ The server starts and listens for client connections on port 4433.
 On another machine (or the same machine for testing):
 
 ```bash
-wayray-client \
+wrclient \
   --server 192.168.1.100:4433 \
   --token my-dev-token \
   --ca ./certs/server.crt  # Trust the self-signed cert
@@ -58,7 +58,7 @@ nautilus &      # File manager
 3. Your applications keep running on the server
 4. Reconnect with the same token:
    ```bash
-   wayray-client --server 192.168.1.100:4433 --token my-dev-token
+   wrclient --server 192.168.1.100:4433 --token my-dev-token
    ```
 5. Your desktop reappears with all windows intact
 

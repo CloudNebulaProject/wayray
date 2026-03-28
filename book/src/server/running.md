@@ -5,7 +5,7 @@
 ## Standalone
 
 ```bash
-wayray-server --config /etc/wayray/wayray-server.toml
+wrsrvd --config /etc/wayray/wrsrvd.toml
 ```
 
 ## Systemd Service
@@ -17,7 +17,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/wayray-server --config /etc/wayray/wayray-server.toml
+ExecStart=/usr/bin/wrsrvd --config /etc/wayray/wrsrvd.toml
 Restart=always
 User=wayray
 Group=wayray
@@ -30,8 +30,8 @@ WantedBy=multi-user.target
 
 ```bash
 docker run -d \
-  --name wayray-server \
+  --name wrsrvd \
   -p 4433:4433/udp \
   -v /etc/wayray:/etc/wayray:ro \
-  wayray/wayray-server:latest
+  wayray/wrsrvd:latest
 ```
