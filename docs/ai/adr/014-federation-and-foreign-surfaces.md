@@ -21,6 +21,66 @@ Company B publishes specific applications (e.g., an internal tool) that Company 
 **Scenario 4: Cross-server apps within one org**
 A large organization runs WayRay servers in multiple departments. A user's session is on Server A but they need an app that's only licensed/installed on Server B. That app should appear in their desktop seamlessly.
 
+### The Direct Remote Access Problem
+
+**Scenario 4b: At a friend's place**
+You're at a friend's house. They have a WayRay terminal. You want YOUR desktop from YOUR server (at home, in the cloud, at the office). Your friend's infrastructure is not involved at all -- their terminal is just a screen, keyboard, and network connection. No federation needed, no server-to-server trust. The client connects directly to your server over the internet.
+
+**Scenario 4c: BYOD at a customer site**
+You're working on-site at a customer. You sit at any available terminal (theirs, a shared kiosk, a conference room). You authenticate against your own company's server. Your desktop comes from your server over the internet. The customer's network is just a pipe.
+
+These are different from federation: no cooperation between servers is required. The WayRay client is truly stateless and server-agnostic -- it can connect to ANY WayRay server the user directs it to.
+
+#### Direct Remote Flow
+
+```
+┌──────────────┐                              ┌──────────────────┐
+│ Friend's     │       Internet / WAN         │ Your WayRay      │
+│ thin client  │─────────────────────────────►│ server (home /   │
+│              │   QUIC + TLS 1.3             │ cloud / office)  │
+│ Your token   │                              │                  │
+│ authenticates│◄─────────────────────────────│ Your session     │
+│ against YOUR │   Display + Audio frames     │ resumes          │
+│ server       │                              │                  │
+└──────────────┘                              └──────────────────┘
+
+Friend's WayRay server: not involved at all.
+The client just needs network access to your server.
+```
+
+This requires:
+1. **Multi-server client UI**: The greeter/client must let the user choose which server to connect to (not hardcoded to one server)
+2. **Token routing**: The user's token (BLE, NFC, software) carries or is associated with a server address
+3. **Internet-reachable servers**: The user's WayRay server must be accessible (direct, QUIC NAT traversal, or relay)
+4. **No local server involvement**: The friend's/customer's WayRay server is completely bypassed
+
+#### Server Selection in the Client
+
+```
+┌─────────────────────────────────────────┐
+│           WayRay Client                  │
+│                                          │
+│  Connect to:                             │
+│                                          │
+│  ┌─ Recent ──────────────────────────┐  │
+│  │  ★ home.wayray.example.com        │  │
+│  │    work.corpx.com                  │  │
+│  └───────────────────────────────────┘  │
+│                                          │
+│  ┌─ Local Server ────────────────────┐  │
+│  │    this-office.local (auto-discovered)│
+│  └───────────────────────────────────┘  │
+│                                          │
+│  ┌─ Custom ──────────────────────────┐  │
+│  │    [server address...............]  │  │
+│  └───────────────────────────────────┘  │
+│                                          │
+│         [Connect]                        │
+└──────────────────────────────────────────┘
+```
+
+Or with token-based routing: the BLE/NFC companion app stores the user's server address alongside the session token. When the phone is detected, the client knows both WHO the user is AND where their server lives. Fully automatic.
+
 ### The Sandboxing Problem
 
 Even within a single session, not all apps should be equal:
@@ -36,7 +96,13 @@ Multiple users' sessions run on the same server. Each session is isolated in a z
 
 ### The Common Thread
 
-All seven scenarios are the same problem at different scales:
+These scenarios fall into three categories:
+
+1. **Direct remote**: Client connects to user's own server, no local server involved (4b, 4c). Simplest -- just needs multi-server client UI and internet reachability.
+2. **Federation**: Surfaces from one server appear in a session on another server (1, 2, 3, 4). Requires server-to-server trust.
+3. **Sandboxing**: Surfaces from an isolated local environment appear alongside local windows (5, 6, 7). Requires local trust boundaries.
+
+Categories 2 and 3 share the same underlying mechanism -- foreign surface integration:
 
 ```
 ┌─────────────────────────────────────────┐

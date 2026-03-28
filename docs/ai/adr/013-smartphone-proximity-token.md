@@ -199,10 +199,21 @@ This implements the same `TokenProvider` trait as smart cards (ADR-004). The ses
 
 The phone app is intentionally minimal:
 1. One-time setup: authenticate with IdP (OIDC), receive signing key
-2. Background service: broadcast BLE beacon with rotating signed token
-3. Optional: respond to GATT challenges for mutual auth
-4. Optional: show notification when session attaches/detaches
-5. No remote desktop functionality -- the phone is a **key**, not a viewer
+2. Configure home server address (e.g., `home.wayray.example.com:4433`)
+3. Background service: broadcast BLE beacon with rotating signed token
+4. Optional: respond to GATT challenges for mutual auth
+5. Optional: show notification when session attaches/detaches
+6. No remote desktop functionality -- the phone is a **key**, not a viewer
+
+The BLE beacon payload includes the user's server address alongside the session token. When a WayRay client detects the phone, it knows both WHO the user is AND where their server lives. This enables direct remote access (ADR-014): sit at any terminal anywhere in the world, your phone tells it where to find your desktop.
+
+```
+BLE Payload (encrypted):
+  token_id:  "abc123"
+  server:    "home.wayray.example.com:4433"
+  timestamp: 1743206400
+  hmac:      <signature>
+```
 
 Platform:
 - Android: foreground service with BLE advertising
