@@ -1,6 +1,9 @@
 mod errors;
+mod state;
 
+use crate::state::WayRay;
 use miette::Result;
+use smithay::reexports::wayland_server::Display;
 use tracing::info;
 
 fn main() -> Result<()> {
@@ -12,5 +15,11 @@ fn main() -> Result<()> {
         .init();
 
     info!("wrsrvd starting");
+
+    let mut display = Display::<WayRay>::new()
+        .map_err(|e| errors::WayRayError::DisplayInit(Box::new(e)))?;
+    let _state = WayRay::new(&mut display);
+    info!("compositor state initialized");
+
     Ok(())
 }
