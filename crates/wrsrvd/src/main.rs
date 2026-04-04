@@ -1,5 +1,6 @@
 mod errors;
 mod handlers;
+mod render;
 mod state;
 
 use std::sync::Arc;
@@ -11,8 +12,8 @@ use crate::state::WayRay;
 use miette::Result;
 use smithay::{
     backend::{
-        renderer::gles::GlesRenderer,
-        winit::{self, WinitEvent},
+        renderer::{damage::OutputDamageTracker, gles::GlesRenderer},
+        winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::Display,
@@ -25,6 +26,8 @@ use tracing::info;
 struct CalloopData {
     state: WayRay,
     display: Display<WayRay>,
+    backend: WinitGraphicsBackend<GlesRenderer>,
+    damage_tracker: OutputDamageTracker,
 }
 
 fn main() -> Result<()> {
@@ -118,7 +121,7 @@ fn main() -> Result<()> {
 
     // Insert the Winit event loop as a calloop source.
     loop_handle
-        .insert_source(winit_event_loop, move |event, _, _data| match event {
+        .insert_source(winit_event_loop, move |event, _, data| match event {
             WinitEvent::Resized { size, scale_factor } => {
                 info!(?size, scale_factor, "window resized");
             }
@@ -129,7 +132,11 @@ fn main() -> Result<()> {
                 // Input handling is Task 7 -- ignore for now.
             }
             WinitEvent::Redraw => {
-                // Rendering is Task 6 -- ignore for now.
+                render::render_output_frame(
+                    &mut data.state,
+                    &mut data.backend,
+                    &mut data.damage_tracker,
+                );
             }
             WinitEvent::CloseRequested => {
                 info!("close requested, shutting down");
@@ -138,10 +145,15 @@ fn main() -> Result<()> {
         })
         .map_err(|e| errors::WayRayError::EventLoop(Box::new(e.error)))?;
 
-    // Keep a handle to the backend (needed for rendering in Task 6).
-    let _backend = backend;
+    // Create a damage tracker for efficient rendering.
+    let damage_tracker = OutputDamageTracker::from_output(&output);
 
-    let mut calloop_data = CalloopData { state, display };
+    let mut calloop_data = CalloopData {
+        state,
+        display,
+        backend,
+        damage_tracker,
+    };
 
     info!("entering main event loop");
 

@@ -7,6 +7,7 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        seat::WaylandFocus,
         shm::{ShmHandler, ShmState},
     },
 };
@@ -44,6 +45,22 @@ impl CompositorHandler for WayRay {
     fn commit(&mut self, surface: &WlSurface) {
         trace!(?surface, "surface commit");
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        // If this surface belongs to an xdg toplevel that hasn't received
+        // its initial configure yet, send it now so the client can start
+        // drawing.
+        if let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.wl_surface().map(|s| s.into_owned()) == Some(surface.clone()))
+            .cloned()
+        {
+            if let Some(toplevel) = window.toplevel() {
+                if !toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+            }
+        }
     }
 }
 
