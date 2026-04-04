@@ -1,4 +1,5 @@
 mod errors;
+mod handlers;
 mod state;
 
 use crate::state::WayRay;
