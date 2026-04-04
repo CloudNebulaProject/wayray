@@ -1,6 +1,7 @@
 use smithay::{
     desktop::Space,
     input::{Seat, SeatState},
+    output::Output,
     reexports::wayland_server::{Display, DisplayHandle},
     utils::{Clock, Monotonic},
     wayland::{
@@ -28,11 +29,12 @@ pub struct WayRay {
     pub space: Space<smithay::desktop::Window>,
     pub seat: Seat<Self>,
     pub clock: Clock<Monotonic>,
+    pub output: Output,
 }
 
 impl WayRay {
     /// Create a new WayRay compositor state, initializing all Smithay subsystems.
-    pub fn new(display: &mut Display<Self>) -> Self {
+    pub fn new(display: &mut Display<Self>, output: Output) -> Self {
         let dh = display.handle();
 
         let compositor_state = CompositorState::new::<Self>(&dh);
@@ -58,6 +60,7 @@ impl WayRay {
             space: Space::default(),
             seat,
             clock: Clock::new(),
+            output,
         }
     }
 }
