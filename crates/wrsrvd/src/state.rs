@@ -1,8 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event as InputEventTrait,
-        InputBackend, InputEvent, KeyboardKeyEvent,
-        PointerAxisEvent as PointerAxisEventTrait,
+        InputBackend, InputEvent, KeyboardKeyEvent, PointerAxisEvent as PointerAxisEventTrait,
         PointerButtonEvent as PointerButtonEventTrait,
     },
     desktop::{Space, WindowSurfaceType},
@@ -12,48 +11,36 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     output::Output,
-    reexports::wayland_server::{Display, DisplayHandle},
-    utils::{Clock, Monotonic, Physical, Rectangle, SERIAL_COUNTER},
+    reexports::wayland_server::Display,
+    utils::{Clock, Monotonic, SERIAL_COUNTER},
     wayland::{
         compositor::CompositorState,
         output::OutputManagerState,
-        selection::{
-            data_device::DataDeviceState,
-            primary_selection::PrimarySelectionState,
-        },
+        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::xdg::{XdgShellState, decoration::XdgDecorationState},
         shm::ShmState,
     },
 };
 use tracing::info;
 
-/// Captured framebuffer data from the last render pass.
-pub struct CapturedFrame {
-    pub data: Vec<u8>,
-    pub width: i32,
-    pub height: i32,
-    pub damage: Vec<Rectangle<i32, Physical>>,
-}
-
 /// Central compositor state holding all Smithay subsystem states.
 ///
 /// This is the "god struct" pattern required by Smithay — a single type that
 /// implements all handler traits and holds all protocol global state.
 pub struct WayRay {
-    pub display_handle: DisplayHandle,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
-    pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
-    pub xdg_decoration_state: XdgDecorationState,
     pub space: Space<smithay::desktop::Window>,
     pub seat: Seat<Self>,
     pub clock: Clock<Monotonic>,
     pub output: Output,
-    pub last_capture: Option<CapturedFrame>,
+    // Kept alive to maintain their Wayland globals — not accessed directly.
+    _output_manager_state: OutputManagerState,
+    _xdg_decoration_state: XdgDecorationState,
 }
 
 impl WayRay {
@@ -66,7 +53,6 @@ impl WayRay {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
-        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "wayray");
@@ -75,25 +61,21 @@ impl WayRay {
             .expect("failed to add keyboard to seat");
         seat.add_pointer();
 
-        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
-
         info!("all Smithay subsystem states initialized");
 
         Self {
-            display_handle: dh,
             compositor_state,
             xdg_shell_state,
             shm_state,
             seat_state,
-            output_manager_state,
             data_device_state,
             primary_selection_state,
-            xdg_decoration_state,
             space: Space::default(),
             seat,
             clock: Clock::new(),
             output,
-            last_capture: None,
+            _output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
+            _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
         }
     }
 
@@ -171,12 +153,12 @@ impl WayRay {
 
                 let source = event.source();
 
-                let horizontal_amount = event
-                    .amount(Axis::Horizontal)
-                    .unwrap_or_else(|| event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 3.0 / 120.0);
-                let vertical_amount = event
-                    .amount(Axis::Vertical)
-                    .unwrap_or_else(|| event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 3.0 / 120.0);
+                let horizontal_amount = event.amount(Axis::Horizontal).unwrap_or_else(|| {
+                    event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 3.0 / 120.0
+                });
+                let vertical_amount = event.amount(Axis::Vertical).unwrap_or_else(|| {
+                    event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 3.0 / 120.0
+                });
 
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
 
