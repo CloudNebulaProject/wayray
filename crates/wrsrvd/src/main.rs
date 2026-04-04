@@ -128,8 +128,8 @@ fn main() -> Result<()> {
             WinitEvent::Focus(focused) => {
                 info!(focused, "window focus changed");
             }
-            WinitEvent::Input(_event) => {
-                // Input handling is Task 7 -- ignore for now.
+            WinitEvent::Input(event) => {
+                data.state.process_input_event(event);
             }
             WinitEvent::Redraw => {
                 render::render_output_frame(
