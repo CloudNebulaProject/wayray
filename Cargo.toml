@@ -1,6 +1,20 @@
-[package]
-name = "wayray"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "crates/wayray-protocol",
+    "crates/wrsrvd",
+    "crates/wrclient",
+    "crates/wradm",
+]
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MPL-2.0"
+
+[workspace.dependencies]
+wayray-protocol = { path = "crates/wayray-protocol" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"

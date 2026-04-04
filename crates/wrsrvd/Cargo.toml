@@ -1,0 +1,19 @@
+[package]
+name = "wrsrvd"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+wayray-protocol.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+miette.workspace = true
+thiserror.workspace = true
+
+smithay = { version = "0.7", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+    "backend_winit",
+] }

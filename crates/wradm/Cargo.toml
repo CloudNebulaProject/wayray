@@ -1,0 +1,10 @@
+[package]
+name = "wradm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+wayray-protocol.workspace = true
+tracing.workspace = true
+miette.workspace = true
