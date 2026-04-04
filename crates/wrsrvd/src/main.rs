@@ -68,7 +68,7 @@ fn main() -> Result<()> {
         size: window_size,
         refresh: 60_000, // 60 Hz in millihertz
     };
-    output.change_current_state(Some(mode), Some(Transform::Flipped180), None, None);
+    output.change_current_state(Some(mode), Some(Transform::Normal), None, None);
     output.set_preferred(mode);
 
     // Create the global output for Wayland clients to bind to.
@@ -123,6 +123,9 @@ fn main() -> Result<()> {
     loop_handle
         .insert_source(winit_event_loop, move |event, _, data| match event {
             WinitEvent::Resized { size, scale_factor } => {
+                // TODO: Update output mode, damage tracker, and space mapping
+                // to reflect the new window size. Currently the compositor
+                // continues rendering at the original size after resize.
                 info!(?size, scale_factor, "window resized");
             }
             WinitEvent::Focus(focused) => {

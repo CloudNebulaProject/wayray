@@ -2,8 +2,8 @@ use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event as InputEventTrait,
         InputBackend, InputEvent, KeyboardKeyEvent,
-        PointerAxisEvent as JsonPointerAxisEvent,
-        PointerButtonEvent as JsonPointerButtonEvent,
+        PointerAxisEvent as PointerAxisEventTrait,
+        PointerButtonEvent as PointerButtonEventTrait,
     },
     desktop::{Space, WindowSurfaceType},
     input::{
