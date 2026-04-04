@@ -13,16 +13,27 @@ use smithay::{
     },
     output::Output,
     reexports::wayland_server::{Display, DisplayHandle},
-    utils::{Clock, Monotonic, SERIAL_COUNTER},
+    utils::{Clock, Monotonic, Physical, Rectangle, SERIAL_COUNTER},
     wayland::{
         compositor::CompositorState,
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
+        selection::{
+            data_device::DataDeviceState,
+            primary_selection::PrimarySelectionState,
+        },
+        shell::xdg::{XdgShellState, decoration::XdgDecorationState},
         shm::ShmState,
     },
 };
 use tracing::info;
+
+/// Captured framebuffer data from the last render pass.
+pub struct CapturedFrame {
+    pub data: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub damage: Vec<Rectangle<i32, Physical>>,
+}
 
 /// Central compositor state holding all Smithay subsystem states.
 ///
@@ -36,10 +47,13 @@ pub struct WayRay {
     pub seat_state: SeatState<Self>,
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub xdg_decoration_state: XdgDecorationState,
     pub space: Space<smithay::desktop::Window>,
     pub seat: Seat<Self>,
     pub clock: Clock<Monotonic>,
     pub output: Output,
+    pub last_capture: Option<CapturedFrame>,
 }
 
 impl WayRay {
@@ -51,6 +65,8 @@ impl WayRay {
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "wayray");
@@ -71,10 +87,13 @@ impl WayRay {
             seat_state,
             output_manager_state,
             data_device_state,
+            primary_selection_state,
+            xdg_decoration_state,
             space: Space::default(),
             seat,
             clock: Clock::new(),
             output,
+            last_capture: None,
         }
     }
 

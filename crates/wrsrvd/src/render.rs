@@ -1,6 +1,8 @@
 use smithay::{
     backend::{
+        allocator::Fourcc,
         renderer::{
+            ExportMem,
             damage::OutputDamageTracker,
             element::texture::TextureRenderElement,
             gles::{GlesRenderer, GlesTexture},
@@ -8,10 +10,11 @@ use smithay::{
         winit::WinitGraphicsBackend,
     },
     desktop::{Window, space::render_output},
+    utils::{Buffer as BufferCoord, Rectangle, Size},
 };
 use tracing::warn;
 
-use crate::state::WayRay;
+use crate::state::{CapturedFrame, WayRay};
 
 /// Dark grey clear color for the compositor background.
 const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
@@ -33,7 +36,8 @@ pub fn render_output_frame(
     let age = backend.buffer_age().unwrap_or(0);
 
     // Render within a block so framebuffer is dropped before submit.
-    let render_damage = {
+    // Returns (damage, optional captured frame) on success.
+    let render_result = {
         let (renderer, mut framebuffer) = match backend.bind() {
             Ok(pair) => pair,
             Err(err) => {
@@ -59,9 +63,55 @@ pub fn render_output_frame(
 
         match render_result {
             Ok(result) => {
-                // Clone the damage rectangles so we can use them after
-                // the framebuffer is dropped.
-                Ok(result.damage.cloned())
+                // Clone damage before we consume the framebuffer for capture.
+                let damage = result.damage.cloned();
+
+                // Capture the framebuffer while it is still bound.
+                let output_size = state.output.current_mode().unwrap().size;
+                let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(
+                    Size::from((output_size.w, output_size.h)),
+                );
+
+                let capture = match renderer.copy_framebuffer(
+                    &framebuffer,
+                    region,
+                    Fourcc::Argb8888,
+                ) {
+                    Ok(mapping) => match renderer.map_texture(&mapping) {
+                        Ok(pixels) => {
+                            let damage_rects = damage
+                                .as_ref()
+                                .map(|d| d.len())
+                                .unwrap_or(0);
+                            tracing::debug!(
+                                width = output_size.w,
+                                height = output_size.h,
+                                bytes = pixels.len(),
+                                damage_rects,
+                                "framebuffer captured"
+                            );
+                            Some(CapturedFrame {
+                                data: pixels.to_vec(),
+                                width: output_size.w,
+                                height: output_size.h,
+                                damage: damage
+                                    .as_ref()
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            })
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "failed to map framebuffer");
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to copy framebuffer");
+                        None
+                    }
+                };
+
+                Ok((damage, capture))
             }
             Err(err) => {
                 warn!(?err, "damage tracker render failed");
@@ -71,8 +121,12 @@ pub fn render_output_frame(
     };
     // framebuffer is now dropped, backend is no longer borrowed.
 
-    match render_damage {
-        Ok(damage) => {
+    match render_result {
+        Ok((damage, capture)) => {
+            // Store the captured frame for later consumption by the
+            // network transport layer.
+            state.last_capture = capture;
+
             let has_damage = damage.is_some();
 
             let submit_result = if let Some(ref rects) = damage {

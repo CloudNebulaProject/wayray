@@ -1,5 +1,5 @@
 use smithay::{
-    delegate_data_device, delegate_seat,
+    delegate_data_device, delegate_primary_selection, delegate_seat,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     wayland::selection::{
@@ -7,6 +7,7 @@ use smithay::{
         data_device::{
             ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
         },
+        primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
     },
 };
 
@@ -39,5 +40,12 @@ impl DataDeviceHandler for WayRay {
     }
 }
 
+impl PrimarySelectionHandler for WayRay {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
 delegate_seat!(WayRay);
 delegate_data_device!(WayRay);
+delegate_primary_selection!(WayRay);

@@ -54,12 +54,10 @@ impl CompositorHandler for WayRay {
             .elements()
             .find(|w| w.wl_surface().map(|s| s.into_owned()) == Some(surface.clone()))
             .cloned()
+            && let Some(toplevel) = window.toplevel()
+            && !toplevel.is_initial_configure_sent()
         {
-            if let Some(toplevel) = window.toplevel() {
-                if !toplevel.is_initial_configure_sent() {
-                    toplevel.send_configure();
-                }
-            }
+            toplevel.send_configure();
         }
     }
 }
