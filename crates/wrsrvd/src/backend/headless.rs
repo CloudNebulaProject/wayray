@@ -134,7 +134,9 @@ pub fn run(
     state.space.map_output(&output, (0, 0));
 
     // Initialize previous frame buffer (all zeros = black).
-    let frame_size = (output_size.w * output_size.h * 4) as usize;
+    // Use the pixman Image's stride for correct row alignment.
+    let frame_stride = render_buffer.stride();
+    let frame_size = frame_stride * output_size.h as usize;
     let previous_frame = vec![0u8; frame_size];
 
     let mut calloop_data = CalloopData {
@@ -231,9 +233,7 @@ fn render_headless_frame(data: &mut CalloopData) {
     };
 
     let element_count = data.state.space.elements().count();
-    if element_count > 0 {
-        tracing::trace!(element_count, "rendering space with elements");
-    }
+    tracing::debug!(element_count, "render tick");
 
     let custom_elements: &[TextureRenderElement<PixmanTexture>] = &[];
 
@@ -251,16 +251,18 @@ fn render_headless_frame(data: &mut CalloopData) {
 
     match render_result {
         Ok(result) => {
+            let has_damage = result.damage.is_some();
             let damage = result.damage.cloned();
+            tracing::debug!(has_damage, "render complete");
 
             // Drop the render target to release the borrow on the buffer.
             drop(target);
 
             // Read pixels directly from the pixman Image's CPU memory.
-            // PixmanRenderer composites into the buffer in-place, so after
-            // rendering the data is already there — no GPU readback needed.
+            // Use the Image's stride (bytes per row) which may include padding.
             let output_size = data.state.output.current_mode().unwrap().size;
-            let frame_bytes = (output_size.w * output_size.h * 4) as usize;
+            let stride = data.render_buffer.stride();
+            let frame_bytes = stride * output_size.h as usize;
             let pixels = unsafe {
                 let ptr = data.render_buffer.data() as *const u8;
                 std::slice::from_raw_parts(ptr, frame_bytes)
@@ -268,7 +270,7 @@ fn render_headless_frame(data: &mut CalloopData) {
 
             // Send frame over network if a client is connected.
             if data.client_connected {
-                send_frame_to_network(data, pixels, &damage, output_size.w, output_size.h);
+                send_frame_to_network(data, pixels, &damage, output_size.w, output_size.h, stride);
             }
 
             // Send frame callbacks to all mapped surfaces.
@@ -293,9 +295,8 @@ fn send_frame_to_network(
     damage: &Option<Vec<Rectangle<i32, smithay::utils::Physical>>>,
     width: i32,
     height: i32,
+    stride: usize,
 ) {
-    let stride = width as usize * 4;
-
     // Compute XOR diff.
     let diff = encoding::xor_diff(current_pixels, &data.previous_frame);
 
