@@ -28,6 +28,7 @@ PACKAGES=(
     libwayland-dev
     wayland-protocols
     libxkbcommon-dev
+    libxkbcommon-x11-0
 
     # Graphics (Mesa provides EGL/OpenGL for Winit's GlesRenderer)
     libgles2-mesa-dev
@@ -35,7 +36,13 @@ PACKAGES=(
     libgbm-dev
     libdrm-dev
 
-    # Session
+    # X11 (fallback if Wayland EGL doesn't work under virgl)
+    xorg
+    xinit
+    openbox
+    xterm
+
+    # Session (Wayland)
     sway
     foot
     seatd

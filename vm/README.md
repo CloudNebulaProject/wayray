@@ -41,37 +41,72 @@ bash ~/wayray/vm/setup.sh
 sudo reboot
 ```
 
-The setup script installs all dependencies (Wayland libs, Mesa, Sway,
-Rust), builds WayRay, and configures auto-login into a minimal Sway
-session.
+The setup script installs all dependencies (Wayland libs, Mesa, X11,
+Rust), builds WayRay, and configures auto-login.
 
 ## Testing the Compositor
 
-After reboot, the VM auto-logs in and starts Sway. A foot terminal
-opens automatically.
+The Winit backend can run under either X11 or Wayland. Under UTM,
+**X11 is more reliable** — virgl's EGL surface handling has issues
+with Sway/Wayland in virtualized environments.
+
+### Option A: X11 (recommended for UTM)
+
+Start an X session:
 
 ```bash
-# Build and run the compositor
+startx openbox-session
+```
+
+Then from a TTY (`Ctrl+Alt+F2`) or an xterm in the Openbox session:
+
+```bash
+export DISPLAY=:0
 cd ~/wayray
 cargo run --bin wrsrvd
 ```
 
-The wrsrvd window opens inside Sway. Note the Wayland socket name from
-the log output (e.g., `wayland-1`).
+The wrsrvd window opens inside X11. Note the Wayland socket name from
+the log output (e.g., `wayland-2`). In another xterm:
+
+```bash
+WAYLAND_DISPLAY=wayland-2 xterm
+```
+
+An xterm should appear inside the wrsrvd window.
+
+### Option B: Sway (if GPU supports it)
+
+If you have a working Wayland-capable GPU (e.g., bare metal or a VM
+with good virgl support):
+
+```bash
+sway
+```
+
+Then in the foot terminal:
+
+```bash
+cd ~/wayray
+cargo run --bin wrsrvd
+```
 
 Open another terminal with `Super+Return`, then:
 
 ```bash
-# Launch a client inside the compositor
-WAYLAND_DISPLAY=wayland-1 foot
+WAYLAND_DISPLAY=wayland-2 foot
 ```
 
-A foot terminal should appear inside the wrsrvd window. You can:
-- Type in it (keyboard input works)
-- Click on it (pointer input works)
-- See it render (compositor rendering works)
+### What to verify
 
-## Keyboard Shortcuts (Sway)
+- A client window appears inside the wrsrvd compositor window
+- Typing works (keyboard input reaches the client)
+- Clicking works (pointer input reaches the client)
+- The window renders correctly (compositor rendering works)
+
+## Keyboard Shortcuts
+
+**Sway:**
 
 | Shortcut | Action |
 |----------|--------|
@@ -79,45 +114,14 @@ A foot terminal should appear inside the wrsrvd window. You can:
 | `Super+Shift+Q` | Close focused window |
 | `Super+Shift+E` | Exit Sway |
 
+**Openbox:** Right-click the desktop for a menu.
+
 ## Troubleshooting
 
-### Sway fails to start
+### EGL errors under Sway (BAD_SURFACE, BadAlloc)
 
-If Sway fails with a GPU or seat error:
-
-```bash
-# Check seatd is running
-systemctl status seatd
-
-# Check group membership (need seat and video)
-groups
-
-# If missing, add and reboot
-sudo usermod -aG seat,video $USER
-sudo reboot
-```
-
-If the VirtIO GPU isn't working, try switching UTM to QEMU backend:
-
-1. Shut down the VM
-2. Edit VM settings
-3. Under **System**, uncheck "Use Apple Virtualization"
-4. Boot again
-
-### Black screen after reboot
-
-Switch to TTY2 with `Ctrl+Alt+F2`, log in, and check:
-
-```bash
-# Try starting Sway manually
-sway
-
-# Check the auto-login override
-cat /etc/systemd/system/getty@tty1.service.d/override.conf
-
-# Check .profile for Sway launch
-tail ~/.profile
-```
+This is a known issue with virgl + UTM. Use the X11 path instead
+(Option A above).
 
 ### Build fails
 
@@ -132,11 +136,11 @@ rustc --version
 cargo build --workspace
 ```
 
-### Missing Wayland/EGL libraries
+### Missing libraries
 
-If `cargo build` fails with missing `-lwayland-client` or EGL errors:
+If `cargo build` or `cargo run` fails with missing libraries:
 
 ```bash
-# Reinstall dev packages
-sudo apt-get install -y libwayland-dev libegl1-mesa-dev libgles2-mesa-dev libxkbcommon-dev
+sudo apt-get install -y libwayland-dev libegl1-mesa-dev libgles2-mesa-dev \
+    libxkbcommon-dev libxkbcommon-x11-0
 ```
