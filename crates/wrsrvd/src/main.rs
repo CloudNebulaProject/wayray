@@ -1,6 +1,7 @@
 mod backend;
 mod errors;
 mod handlers;
+pub mod network;
 mod state;
 
 use crate::state::WayRay;
