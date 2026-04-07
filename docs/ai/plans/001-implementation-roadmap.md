@@ -102,7 +102,12 @@
 - Session storage: in-memory with optional persistence (SeaORM + SQLite)
 - Session timeout and cleanup policies
 
-### 3.2 Greeter and Session Launch
+### 3.2 WM Workspace Protocol Implementation
+- Implement workspace create/destroy/set_active in `wayray_wm_workspace_v1` dispatch
+- Implement assign_window and set_window_tags for tag-based systems
+- Wire workspace visibility into the render loop (show/hide windows per active workspace)
+
+### 3.3 Greeter and Session Launch
 - Define session launcher interface (events over Unix socket: session_requested, session_authenticated, session_logout)
 - Implement reference session launcher (`wrsessd`) that:
   - Receives "new session needed" events from WayRay
@@ -117,18 +122,18 @@
 - User session config: `~/.config/wayray/session.toml` (WM, panel, launcher, autostart apps)
 - Support `wlr-layer-shell` protocol for panels, launchers, notification daemons
 
-### 3.3 Token-Based Session Identity
+### 3.4 Token-Based Session Identity
 - Token-based session identification (smart card ID, badge, or software token)
 - Session-token binding in session store
 - WayRay does NOT own authentication -- delegates to session launcher / PAM
 
-### 3.4 Hot-Desking (Session Mobility)
+### 3.5 Hot-Desking (Session Mobility)
 - Token insertion triggers session lookup across server pool
 - Session reconnection: rebind existing session to new client endpoint
 - Session disconnect: unbind from client, keep session running
 - Sub-second reconnection target (< 500ms)
 
-### 3.5 Multi-Server Support
+### 3.6 Multi-Server Support
 - Server discovery protocol (mDNS or custom)
 - Session registry: which sessions live on which servers
 - Cross-server session redirect
@@ -159,7 +164,14 @@
 
 ## Phase 5: Production Hardening (Weeks 14-17)
 
-### 5.1 Platform-Specific Backends
+### 5.1 WM Protocol Completion
+- Implement `set_z_above`/`set_z_below` relative z-ordering in WM protocol
+- Implement `set_borders` server-side border rendering
+- Implement `set_output` multi-output window assignment
+- Implement `start_move`/`start_resize` interactive pointer grabs
+- Create ProtocolAdapter that implements WindowManager trait, bridging external WM as the active WM
+
+### 5.2 Platform-Specific Backends
 - Linux: DRM/KMS backend for running wrsrvd on hardware (optional, feature-gated)
 - Linux: Multi-GPU support via MultiRenderer
 - Linux: Session management via logind/libseat
@@ -167,17 +179,17 @@
 - illumos: Zones integration for session isolation
 - CI: Test matrix for both Linux and illumos
 
-### 5.2 XWayland Support
+### 5.3 XWayland Support
 - Integrate Smithay's XWayland module for X11 application compatibility
 - Handle X11 clipboard integration
 
-### 5.3 Performance Optimization
+### 5.4 Performance Optimization
 - Adaptive bitrate based on network conditions
 - Hardware encoding path (VAAPI, NVENC)
 - Zero-copy frame capture via DMA-BUF export to encoder
 - Client-side frame interpolation for network jitter compensation
 
-### 5.4 Security
+### 5.5 Security
 - TLS 1.3 for all QUIC connections (mandatory)
 - Certificate-based mutual authentication
 - Session encryption at rest
