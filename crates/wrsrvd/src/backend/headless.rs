@@ -237,6 +237,9 @@ fn render_headless_frame(data: &mut CalloopData) {
     // Must be called each frame before rendering.
     data.state.space.refresh();
 
+    // Apply WM render phase — positions/z-order before frame capture.
+    data.state.apply_wm_render_commands();
+
     let custom_elements: &[TextureRenderElement<PixmanTexture>] = &[];
 
     let render_result = render_output::<_, _, Window, _>(

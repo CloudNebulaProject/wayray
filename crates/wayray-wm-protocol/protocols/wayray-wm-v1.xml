@@ -1,0 +1,414 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wayray_wm_v1">
+  <copyright>
+    Copyright 2026 WayRay Contributors
+    SPDX-License-Identifier: MPL-2.0
+  </copyright>
+
+  <description summary="WayRay pluggable window management protocol">
+    This protocol allows an external window manager process to control
+    window layout, focus, and keybindings in the WayRay compositor.
+
+    Only one WM client may be bound at a time. If a second WM binds,
+    the first receives a "replaced" event and should disconnect.
+
+    Window management follows a two-phase transaction model:
+    1. Manage phase: WM makes policy decisions (dimensions, focus, decorations)
+    2. Render phase: WM specifies visual placement (position, z-order, visibility)
+  </description>
+
+  <!-- ================================================================== -->
+  <!-- Manager: global entry point                                         -->
+  <!-- ================================================================== -->
+
+  <interface name="wayray_wm_manager_v1" version="1">
+    <description summary="global window management interface">
+      The main entry point for external window managers. A WM client binds
+      this global to receive window lifecycle events and participate in the
+      two-phase manage/render transaction model.
+    </description>
+
+    <!-- Events: compositor -> WM -->
+
+    <event name="window_new">
+      <description summary="a new toplevel window appeared">
+        Sent when a new toplevel is mapped. The WM receives a
+        wayray_wm_window_v1 object to interact with this window.
+        Property events (title, app_id, size_hints) follow immediately,
+        terminated by a done event.
+      </description>
+      <arg name="window" type="new_id" interface="wayray_wm_window_v1"/>
+    </event>
+
+    <event name="window_closed">
+      <description summary="a toplevel window was destroyed">
+        Sent when a toplevel is unmapped and destroyed. The wayray_wm_window_v1
+        object becomes inert after this event.
+      </description>
+      <arg name="window" type="object" interface="wayray_wm_window_v1"/>
+    </event>
+
+    <event name="manage_start">
+      <description summary="begin manage phase">
+        Sent when state changes require WM policy decisions. The WM should
+        evaluate pending changes and respond with policy requests on the
+        affected window objects, then call manage_done.
+      </description>
+    </event>
+
+    <event name="render_start">
+      <description summary="begin render phase">
+        Sent after clients have acknowledged configures and committed. The WM
+        should set visual placement (position, z-order, visibility) on window
+        objects, then call render_done. All changes are applied atomically.
+      </description>
+    </event>
+
+    <event name="output_new">
+      <description summary="a new output appeared">
+        Sent when a new output is available for window placement.
+      </description>
+      <arg name="output_name" type="string"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+
+    <event name="output_removed">
+      <description summary="an output was removed">
+        Sent when an output is no longer available.
+      </description>
+      <arg name="output_name" type="string"/>
+    </event>
+
+    <event name="replaced">
+      <description summary="this WM has been replaced">
+        Sent when another WM client has connected and taken over. The old WM
+        should disconnect gracefully after receiving this event.
+      </description>
+    </event>
+
+    <!-- Requests: WM -> compositor -->
+
+    <request name="manage_done">
+      <description summary="finish manage phase">
+        Signals that the WM has finished making policy decisions for this
+        manage phase. The compositor will send configures to affected windows.
+      </description>
+    </request>
+
+    <request name="render_done">
+      <description summary="finish render phase">
+        Signals that the WM has finished specifying visual placement. The
+        compositor will apply all changes atomically in one frame.
+      </description>
+    </request>
+
+    <request name="get_seat">
+      <description summary="get seat interface for keybindings">
+        Creates a wayray_wm_seat_v1 object for registering keybindings
+        and initiating interactive move/resize operations.
+      </description>
+      <arg name="id" type="new_id" interface="wayray_wm_seat_v1"/>
+    </request>
+
+    <request name="get_workspace_manager">
+      <description summary="get workspace management interface">
+        Creates a wayray_wm_workspace_v1 object for managing virtual
+        desktops and window-to-workspace assignments.
+      </description>
+      <arg name="id" type="new_id" interface="wayray_wm_workspace_v1"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroy this manager object. The compositor returns to its built-in
+        window management.
+      </description>
+    </request>
+  </interface>
+
+  <!-- ================================================================== -->
+  <!-- Window: per-toplevel interface                                       -->
+  <!-- ================================================================== -->
+
+  <interface name="wayray_wm_window_v1" version="1">
+    <description summary="per-window management interface">
+      Represents a single toplevel window. The compositor sends property
+      events and the WM sends policy/placement requests.
+
+      Policy requests (propose_dimensions, set_focus, etc.) should be sent
+      during the manage phase. Visual placement requests (set_position,
+      set_z_*, etc.) should be sent during the render phase.
+    </description>
+
+    <!-- Property events: compositor -> WM -->
+
+    <event name="title">
+      <description summary="window title changed"/>
+      <arg name="title" type="string"/>
+    </event>
+
+    <event name="app_id">
+      <description summary="application identifier changed"/>
+      <arg name="app_id" type="string"/>
+    </event>
+
+    <event name="parent">
+      <description summary="parent window for dialogs">
+        Null if this window has no parent.
+      </description>
+      <arg name="parent" type="object" interface="wayray_wm_window_v1" allow-null="true"/>
+    </event>
+
+    <event name="size_hints">
+      <description summary="client size constraints">
+        A value of 0 means unconstrained.
+      </description>
+      <arg name="min_width" type="int"/>
+      <arg name="min_height" type="int"/>
+      <arg name="max_width" type="int"/>
+      <arg name="max_height" type="int"/>
+    </event>
+
+    <event name="fullscreen_request">
+      <description summary="client requests fullscreen">
+        Respond with grant_fullscreen or deny_fullscreen during manage phase.
+      </description>
+    </event>
+
+    <event name="maximize_request">
+      <description summary="client requests maximize"/>
+    </event>
+
+    <event name="close_request">
+      <description summary="client or user requested close"/>
+    </event>
+
+    <event name="dimensions">
+      <description summary="committed surface dimensions">
+        Actual committed size after client draws.
+      </description>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+
+    <event name="done">
+      <description summary="end of property batch">
+        Process all preceding property events atomically.
+      </description>
+    </event>
+
+    <!-- Policy requests: WM -> compositor (manage phase) -->
+
+    <request name="propose_dimensions">
+      <description summary="suggest window dimensions"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+
+    <request name="set_focus">
+      <description summary="give keyboard focus to this window"/>
+    </request>
+
+    <request name="use_ssd">
+      <description summary="use server-side decorations"/>
+    </request>
+
+    <request name="use_csd">
+      <description summary="use client-side decorations"/>
+    </request>
+
+    <request name="grant_fullscreen">
+      <description summary="allow fullscreen"/>
+    </request>
+
+    <request name="deny_fullscreen">
+      <description summary="deny fullscreen"/>
+    </request>
+
+    <request name="close">
+      <description summary="ask client to close"/>
+    </request>
+
+    <!-- Visual placement requests: WM -> compositor (render phase) -->
+
+    <request name="set_position">
+      <description summary="set window position relative to output origin"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+
+    <request name="set_z_above">
+      <description summary="place above another window"/>
+      <arg name="sibling" type="object" interface="wayray_wm_window_v1"/>
+    </request>
+
+    <request name="set_z_below">
+      <description summary="place below another window"/>
+      <arg name="sibling" type="object" interface="wayray_wm_window_v1"/>
+    </request>
+
+    <request name="set_z_top">
+      <description summary="place at top of z-order stack"/>
+    </request>
+
+    <request name="set_z_bottom">
+      <description summary="place at bottom of z-order stack"/>
+    </request>
+
+    <request name="set_borders">
+      <description summary="set border color (0-255) and width"/>
+      <arg name="red" type="uint"/>
+      <arg name="green" type="uint"/>
+      <arg name="blue" type="uint"/>
+      <arg name="alpha" type="uint"/>
+      <arg name="width" type="int"/>
+    </request>
+
+    <request name="show">
+      <description summary="make window visible"/>
+    </request>
+
+    <request name="hide">
+      <description summary="hide window (remains managed)"/>
+    </request>
+
+    <request name="set_output">
+      <description summary="assign window to an output"/>
+      <arg name="output_name" type="string"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this window object"/>
+    </request>
+  </interface>
+
+  <!-- ================================================================== -->
+  <!-- Seat: keybinding and input management                               -->
+  <!-- ================================================================== -->
+
+  <interface name="wayray_wm_seat_v1" version="1">
+    <description summary="keybinding and input management for WM">
+      Register keybindings, create binding modes, and initiate
+      interactive move/resize operations.
+    </description>
+
+    <!-- Requests: WM -> compositor -->
+
+    <request name="bind_key">
+      <description summary="register a keybinding">
+        Empty mode string means default mode.
+      </description>
+      <arg name="key" type="uint" summary="Linux evdev keycode"/>
+      <arg name="modifiers" type="uint" summary="modifier bitmask"/>
+      <arg name="mode" type="string" summary="binding mode name"/>
+    </request>
+
+    <request name="unbind_key">
+      <description summary="remove a keybinding"/>
+      <arg name="key" type="uint"/>
+      <arg name="modifiers" type="uint"/>
+      <arg name="mode" type="string"/>
+    </request>
+
+    <request name="create_mode">
+      <description summary="create a named binding mode (like i3)"/>
+      <arg name="name" type="string"/>
+    </request>
+
+    <request name="activate_mode">
+      <description summary="switch active binding mode">
+        Empty string returns to default mode only.
+      </description>
+      <arg name="name" type="string"/>
+    </request>
+
+    <request name="start_move">
+      <description summary="begin interactive pointer-driven window move"/>
+      <arg name="window" type="object" interface="wayray_wm_window_v1"/>
+    </request>
+
+    <request name="start_resize">
+      <description summary="begin interactive pointer-driven window resize"/>
+      <arg name="window" type="object" interface="wayray_wm_window_v1"/>
+      <arg name="edges" type="uint" summary="resize edge bitmask"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy seat interface and all keybindings"/>
+    </request>
+
+    <!-- Events: compositor -> WM -->
+
+    <event name="binding_pressed">
+      <description summary="a registered keybinding was pressed"/>
+      <arg name="key" type="uint"/>
+      <arg name="modifiers" type="uint"/>
+    </event>
+
+    <event name="binding_released">
+      <description summary="a registered keybinding was released"/>
+      <arg name="key" type="uint"/>
+      <arg name="modifiers" type="uint"/>
+    </event>
+  </interface>
+
+  <!-- ================================================================== -->
+  <!-- Workspace: virtual desktop / tag management                         -->
+  <!-- ================================================================== -->
+
+  <interface name="wayray_wm_workspace_v1" version="1">
+    <description summary="workspace and virtual desktop management">
+      Create and manage virtual desktops. Supports both exclusive workspaces
+      and tag-based systems (windows on multiple tags simultaneously).
+    </description>
+
+    <!-- Requests: WM -> compositor -->
+
+    <request name="create_workspace">
+      <description summary="create a named workspace"/>
+      <arg name="name" type="string"/>
+    </request>
+
+    <request name="destroy_workspace">
+      <description summary="destroy a workspace (windows become unassigned)"/>
+      <arg name="name" type="string"/>
+    </request>
+
+    <request name="set_active_workspace">
+      <description summary="set visible workspace on an output"/>
+      <arg name="output_name" type="string"/>
+      <arg name="workspace_name" type="string"/>
+    </request>
+
+    <request name="assign_window">
+      <description summary="move window to a workspace"/>
+      <arg name="window" type="object" interface="wayray_wm_window_v1"/>
+      <arg name="workspace_name" type="string"/>
+    </request>
+
+    <request name="set_window_tags">
+      <description summary="set tag bitmask (dwm-style)">
+        Window is visible when any tag matches the output's active tags.
+      </description>
+      <arg name="window" type="object" interface="wayray_wm_window_v1"/>
+      <arg name="tags" type="uint" summary="bitmask of active tags"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy workspace manager"/>
+    </request>
+
+    <!-- Events: compositor -> WM -->
+
+    <event name="workspace_created">
+      <description summary="workspace was created"/>
+      <arg name="name" type="string"/>
+    </event>
+
+    <event name="workspace_destroyed">
+      <description summary="workspace was destroyed"/>
+      <arg name="name" type="string"/>
+    </event>
+  </interface>
+</protocol>

@@ -1,0 +1,17 @@
+[package]
+name = "wayray-wm-protocol"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "WayRay pluggable window management Wayland protocol"
+
+[dependencies]
+wayland-backend = "0.3"
+wayland-server = { version = "0.31", optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-scanner = "0.31"
+
+[features]
+default = []
+server = ["dep:wayland-server"]
+client = ["dep:wayland-client"]

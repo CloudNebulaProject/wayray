@@ -14,6 +14,7 @@ use smithay::{
 use tracing::info;
 
 use crate::state::WayRay;
+use crate::wm::types::WindowInfo;
 
 impl XdgShellHandler for WayRay {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -21,16 +22,46 @@ impl XdgShellHandler for WayRay {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Set a suggested size and send the initial configure so the
-        // client can start drawing.
+        let output_size = self.output.current_mode().unwrap().size;
+
+        // Gather window info for the WM.
+        let info = WindowInfo {
+            title: None,
+            app_id: None,
+            output_width: output_size.w,
+            output_height: output_size.h,
+            min_size: None,
+            max_size: None,
+        };
+
+        let window = Window::new_wayland_window(surface.clone());
+        let id = self.register_window(window.clone());
+
+        // Ask the WM where to place and how to size this window.
+        let response = self.wm_state.active_wm().on_new_toplevel(id, info);
+
         surface.with_pending_state(|state| {
-            state.size = Some((800, 600).into());
+            state.size = Some(response.size.into());
         });
         surface.send_configure();
 
-        let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), true);
-        info!("new toplevel mapped with suggested size 800x600");
+        self.space
+            .map_element(window.clone(), response.position, true);
+
+        // Set keyboard focus if the WM requested it.
+        if response.focus {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let keyboard = self.seat.get_keyboard().unwrap();
+            let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
+            keyboard.set_focus(self, wl_surface, serial);
+        }
+
+        info!(
+            ?id,
+            size = ?response.size,
+            pos = ?response.position,
+            "new toplevel mapped via WM"
+        );
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

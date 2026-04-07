@@ -3283,6 +3283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayray-wm-protocol"
+version = "0.1.0"
+dependencies = [
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
+ "wayland-server",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.94"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3806,6 +3816,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wr-wm-tiling"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+ "wayland-client",
+ "wayray-wm-protocol",
+]
+
+[[package]]
 name = "wradm"
 version = "0.1.0"
 dependencies = [
@@ -3849,6 +3869,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wayray-protocol",
+ "wayray-wm-protocol",
 ]
 
 [[package]]

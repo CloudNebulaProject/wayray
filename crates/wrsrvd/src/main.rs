@@ -3,6 +3,7 @@ mod errors;
 mod handlers;
 pub mod network;
 mod state;
+mod wm;
 
 use crate::network::{ServerConfig, start_server};
 use crate::state::WayRay;

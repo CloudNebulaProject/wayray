@@ -1,0 +1,12 @@
+[package]
+name = "wr-wm-tiling"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Reference tiling window manager for WayRay"
+
+[dependencies]
+wayray-wm-protocol = { workspace = true, features = ["client"] }
+wayland-client = "0.31"
+tracing.workspace = true
+tracing-subscriber.workspace = true

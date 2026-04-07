@@ -25,6 +25,8 @@ use smithay::{
 use tracing::info;
 use wayray_protocol::messages::InputMessage;
 
+use crate::wm::{self, WmState};
+
 /// Central compositor state holding all Smithay subsystem states.
 ///
 /// This is the "god struct" pattern required by Smithay — a single type that
@@ -40,6 +42,12 @@ pub struct WayRay {
     pub seat: Seat<Self>,
     pub clock: Clock<Monotonic>,
     pub output: Output,
+    /// Window management state — delegates to built-in or external WM.
+    pub wm_state: WmState,
+    /// Maps Smithay Window to WindowId for WM communication.
+    pub window_ids: Vec<(wm::types::WindowId, smithay::desktop::Window)>,
+    /// Counter for allocating WindowIds.
+    next_window_id: u64,
     // Kept alive to maintain their Wayland globals — not accessed directly.
     _output_manager_state: OutputManagerState,
     _xdg_decoration_state: XdgDecorationState,
@@ -65,6 +73,13 @@ impl WayRay {
 
         info!("all Smithay subsystem states initialized");
 
+        let output_mode = output.current_mode().unwrap();
+        let mut wm_state = WmState::new(output_mode.size.w, output_mode.size.h);
+
+        // Register the WM protocol global for external window managers.
+        let wm_protocol = wm::protocol::WmProtocolState::new::<Self>(&dh);
+        wm_state.init_protocol(wm_protocol);
+
         Self {
             compositor_state,
             xdg_shell_state,
@@ -76,8 +91,66 @@ impl WayRay {
             seat,
             clock: Clock::new(),
             output,
+            wm_state,
+            window_ids: Vec::new(),
+            next_window_id: 1,
             _output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
             _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
+        }
+    }
+
+    /// Allocate a new WindowId and associate it with a Smithay Window.
+    pub fn register_window(&mut self, window: smithay::desktop::Window) -> wm::types::WindowId {
+        let id = wm::types::WindowId::from_raw(self.next_window_id);
+        self.next_window_id += 1;
+        self.window_ids.push((id, window));
+        id
+    }
+
+    /// Find the WindowId for a Smithay Window.
+    pub fn window_id_for(&self, window: &smithay::desktop::Window) -> Option<wm::types::WindowId> {
+        self.window_ids
+            .iter()
+            .find(|(_, w)| w == window)
+            .map(|(id, _)| *id)
+    }
+
+    /// Find the Smithay Window for a WindowId.
+    #[allow(dead_code)]
+    pub fn window_for_id(&self, id: wm::types::WindowId) -> Option<&smithay::desktop::Window> {
+        self.window_ids
+            .iter()
+            .find(|(wid, _)| *wid == id)
+            .map(|(_, w)| w)
+    }
+
+    /// Remove a window from the id mapping.
+    #[allow(dead_code)]
+    pub fn unregister_window(&mut self, window: &smithay::desktop::Window) {
+        if let Some(id) = self.window_id_for(window) {
+            self.wm_state.active_wm().on_close_toplevel(id);
+            self.window_ids.retain(|(_, w)| w != window);
+        }
+    }
+
+    /// Apply WM render commands to the Space before frame rendering.
+    pub fn apply_wm_render_commands(&mut self) {
+        let ids: Vec<_> = self.window_ids.iter().map(|(id, _)| *id).collect();
+        let commands = self.wm_state.active_wm().on_render(&ids);
+
+        for cmd in commands {
+            if let Some(window) = self
+                .window_ids
+                .iter()
+                .find(|(id, _)| *id == cmd.id)
+                .map(|(_, w)| w.clone())
+            {
+                if cmd.visible {
+                    self.space.map_element(window, cmd.position, false);
+                } else {
+                    self.space.unmap_elem(&window);
+                }
+            }
         }
     }
 
@@ -128,15 +201,25 @@ impl WayRay {
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
 
-                // On button press, focus the window under the pointer.
+                // On button press, focus the window under the pointer via WM.
                 if event.state() == ButtonState::Pressed {
                     let pos = pointer.current_location();
-                    if let Some((window, _loc)) = self.space.element_under(pos) {
-                        let window = window.clone();
-                        self.space.raise_element(&window, true);
-
+                    if let Some(focus_window) = self
+                        .space
+                        .element_under(pos)
+                        .map(|(w, _)| w.clone())
+                        .and_then(|w| self.window_id_for(&w))
+                        .and_then(|wid| self.wm_state.active_wm().on_pointer_focus(wid))
+                        .and_then(|fid| {
+                            self.window_ids
+                                .iter()
+                                .find(|(id, _)| *id == fid)
+                                .map(|(_, w)| w.clone())
+                        })
+                    {
+                        self.space.raise_element(&focus_window, true);
                         let keyboard = self.seat.get_keyboard().unwrap();
-                        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
+                        let wl_surface = focus_window.toplevel().map(|t| t.wl_surface().clone());
                         keyboard.set_focus(self, wl_surface, serial);
                     }
                 }
@@ -252,15 +335,25 @@ impl WayRay {
                     wayray_protocol::messages::ButtonState::Released => ButtonState::Released,
                 };
 
-                // Click-to-focus on button press.
+                // Click-to-focus on button press — delegate to WM.
                 if state == ButtonState::Pressed {
                     let pos = pointer.current_location();
-                    if let Some((window, _loc)) = self.space.element_under(pos) {
-                        let window = window.clone();
-                        self.space.raise_element(&window, true);
-
+                    if let Some(focus_window) = self
+                        .space
+                        .element_under(pos)
+                        .map(|(w, _)| w.clone())
+                        .and_then(|w| self.window_id_for(&w))
+                        .and_then(|wid| self.wm_state.active_wm().on_pointer_focus(wid))
+                        .and_then(|fid| {
+                            self.window_ids
+                                .iter()
+                                .find(|(id, _)| *id == fid)
+                                .map(|(_, w)| w.clone())
+                        })
+                    {
+                        self.space.raise_element(&focus_window, true);
                         let keyboard = self.seat.get_keyboard().unwrap();
-                        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
+                        let wl_surface = focus_window.toplevel().map(|t| t.wl_surface().clone());
                         keyboard.set_focus(self, wl_surface, serial);
                     }
                 }

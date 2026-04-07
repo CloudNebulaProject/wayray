@@ -11,6 +11,7 @@ winit = ["smithay/renderer_gl", "smithay/backend_winit"]
 
 [dependencies]
 wayray-protocol.workspace = true
+wayray-wm-protocol = { workspace = true, features = ["server"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 miette.workspace = true
