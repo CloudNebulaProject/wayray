@@ -5,3 +5,6 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
