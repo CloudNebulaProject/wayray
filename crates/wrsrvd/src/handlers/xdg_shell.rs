@@ -21,6 +21,8 @@ impl XdgShellHandler for WayRay {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Send the initial configure so the client can start drawing.
+        surface.send_configure();
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window, (0, 0), false);
         info!("new toplevel mapped");
