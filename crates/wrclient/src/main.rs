@@ -102,7 +102,11 @@ impl ApplicationHandler for App {
         );
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Use Poll mode so the event loop continuously checks for new frames
+        // instead of blocking until user input arrives.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+
         // Drain any pending frames from the network thread.
         let mut got_frame = false;
         while let Ok(frame) = self.frame_rx.try_recv() {
