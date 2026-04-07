@@ -181,8 +181,9 @@ pub fn run(
     }
 
     info!("headless backend shutting down");
-    calloop_data.net_handle.shutdown();
-    Ok(())
+    // Force exit — the network thread may be blocking on accept().
+    // Proper graceful shutdown with tokio CancellationToken is a future improvement.
+    std::process::exit(0);
 }
 
 /// Drain all pending network events (input, connection changes).

@@ -210,9 +210,10 @@ impl WayRay {
                         smithay::backend::input::KeyState::Released
                     }
                 };
+                // XKB keycodes = evdev scancode + 8
                 keyboard.input::<(), _>(
                     self,
-                    ev.keycode.into(),
+                    (ev.keycode + 8).into(),
                     state,
                     serial,
                     ev.time,

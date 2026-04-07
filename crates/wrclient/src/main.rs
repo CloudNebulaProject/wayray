@@ -125,8 +125,10 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                info!("close requested, exiting");
+                info!("close requested, shutting down");
                 event_loop.exit();
+                // Force exit since the network thread may be blocking.
+                std::process::exit(0);
             }
             WindowEvent::Resized(physical_size) => {
                 if let Some(display) = &mut self.display {
