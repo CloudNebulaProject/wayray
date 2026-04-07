@@ -15,5 +15,7 @@ smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
     "desktop",
     "renderer_gl",
+    "renderer_pixman",
     "backend_winit",
 ] }
+ctrlc = "3"
