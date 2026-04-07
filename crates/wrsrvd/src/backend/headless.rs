@@ -7,7 +7,7 @@ use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            Bind, ExportMem, Offscreen,
+            Bind, Offscreen,
             damage::OutputDamageTracker,
             element::texture::TextureRenderElement,
             pixman::{PixmanRenderer, PixmanTexture},
@@ -230,6 +230,11 @@ fn render_headless_frame(data: &mut CalloopData) {
         }
     };
 
+    let element_count = data.state.space.elements().count();
+    if element_count > 0 {
+        tracing::trace!(element_count, "rendering space with elements");
+    }
+
     let custom_elements: &[TextureRenderElement<PixmanTexture>] = &[];
 
     let render_result = render_output::<_, _, Window, _>(
@@ -248,35 +253,22 @@ fn render_headless_frame(data: &mut CalloopData) {
         Ok(result) => {
             let damage = result.damage.cloned();
 
-            // Read pixels from the CPU buffer for network transport.
-            let output_size = data.state.output.current_mode().unwrap().size;
-            let region: Rectangle<i32, BufferCoord> =
-                Rectangle::from_size(Size::from((output_size.w, output_size.h)));
+            // Drop the render target to release the borrow on the buffer.
+            drop(target);
 
-            match data
-                .renderer
-                .copy_framebuffer(&target, region, Fourcc::Argb8888)
-            {
-                Ok(mapping) => match data.renderer.map_texture(&mapping) {
-                    Ok(pixels) => {
-                        // Send frame over network if a client is connected.
-                        if data.client_connected {
-                            send_frame_to_network(
-                                data,
-                                pixels,
-                                &damage,
-                                output_size.w,
-                                output_size.h,
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "failed to map headless framebuffer");
-                    }
-                },
-                Err(err) => {
-                    tracing::warn!(?err, "failed to copy headless framebuffer");
-                }
+            // Read pixels directly from the pixman Image's CPU memory.
+            // PixmanRenderer composites into the buffer in-place, so after
+            // rendering the data is already there — no GPU readback needed.
+            let output_size = data.state.output.current_mode().unwrap().size;
+            let frame_bytes = (output_size.w * output_size.h * 4) as usize;
+            let pixels = unsafe {
+                let ptr = data.render_buffer.data() as *const u8;
+                std::slice::from_raw_parts(ptr, frame_bytes)
+            };
+
+            // Send frame over network if a client is connected.
+            if data.client_connected {
+                send_frame_to_network(data, pixels, &damage, output_size.w, output_size.h);
             }
 
             // Send frame callbacks to all mapped surfaces.
