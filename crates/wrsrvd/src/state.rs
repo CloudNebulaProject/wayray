@@ -22,6 +22,7 @@ use smithay::{
     },
 };
 use tracing::info;
+use wayray_protocol::messages::InputMessage;
 
 /// Central compositor state holding all Smithay subsystem states.
 ///
@@ -188,6 +189,106 @@ impl WayRay {
                 pointer.frame(self);
             }
             _ => {} // Ignore other events
+        }
+    }
+
+    /// Inject an input event received from a network client into the
+    /// compositor's seat, following the same patterns as `process_input_event`.
+    pub fn inject_network_input(&mut self, msg: InputMessage) {
+        match msg {
+            InputMessage::Keyboard(ev) => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let keyboard = self.seat.get_keyboard().unwrap();
+                let state = match ev.state {
+                    wayray_protocol::messages::KeyState::Pressed => {
+                        smithay::backend::input::KeyState::Pressed
+                    }
+                    wayray_protocol::messages::KeyState::Released => {
+                        smithay::backend::input::KeyState::Released
+                    }
+                };
+                keyboard.input::<(), _>(
+                    self,
+                    ev.keycode.into(),
+                    state,
+                    serial,
+                    ev.time,
+                    |_, _, _| FilterResult::Forward,
+                );
+            }
+            InputMessage::PointerMotion(ev) => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let pointer = self.seat.get_pointer().unwrap();
+
+                let pos = (ev.x, ev.y).into();
+
+                let under = self.space.element_under(pos).and_then(|(window, loc)| {
+                    window
+                        .surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
+                        .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
+                });
+
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location: pos,
+                        serial,
+                        time: ev.time,
+                    },
+                );
+                pointer.frame(self);
+            }
+            InputMessage::PointerButton(ev) => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let pointer = self.seat.get_pointer().unwrap();
+
+                let state = match ev.state {
+                    wayray_protocol::messages::ButtonState::Pressed => ButtonState::Pressed,
+                    wayray_protocol::messages::ButtonState::Released => ButtonState::Released,
+                };
+
+                // Click-to-focus on button press.
+                if state == ButtonState::Pressed {
+                    let pos = pointer.current_location();
+                    if let Some((window, _loc)) = self.space.element_under(pos) {
+                        let window = window.clone();
+                        self.space.raise_element(&window, true);
+
+                        let keyboard = self.seat.get_keyboard().unwrap();
+                        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
+                        keyboard.set_focus(self, wl_surface, serial);
+                    }
+                }
+
+                pointer.button(
+                    self,
+                    &ButtonEvent {
+                        serial,
+                        time: ev.time,
+                        button: ev.button,
+                        state,
+                    },
+                );
+                pointer.frame(self);
+            }
+            InputMessage::PointerAxis(ev) => {
+                let pointer = self.seat.get_pointer().unwrap();
+
+                let axis = match ev.axis {
+                    wayray_protocol::messages::Axis::Horizontal => Axis::Horizontal,
+                    wayray_protocol::messages::Axis::Vertical => Axis::Vertical,
+                };
+
+                let mut frame = AxisFrame::new(ev.time).source(AxisSource::Wheel);
+
+                if ev.value != 0.0 {
+                    frame = frame.value(axis, ev.value);
+                }
+
+                pointer.axis(self, frame);
+                pointer.frame(self);
+            }
         }
     }
 }
