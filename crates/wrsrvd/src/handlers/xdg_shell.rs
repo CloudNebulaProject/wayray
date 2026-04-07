@@ -2,8 +2,7 @@ use smithay::{
     delegate_xdg_decoration, delegate_xdg_shell,
     desktop::Window,
     reexports::{
-        wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode
-            as DecorationMode,
+        wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
         wayland_server::protocol::wl_seat,
     },
     utils::Serial,

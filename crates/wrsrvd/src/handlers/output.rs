@@ -1,8 +1,4 @@
-use smithay::{
-    delegate_output,
-    output::Output,
-    wayland::output::OutputHandler,
-};
+use smithay::{delegate_output, output::Output, wayland::output::OutputHandler};
 
 use crate::state::WayRay;
 

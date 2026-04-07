@@ -5,6 +5,7 @@
 //! length prefix for transmission over QUIC streams.
 
 pub mod codec;
+pub mod encoding;
 pub mod messages;
 
 /// Current protocol version. Incremented on breaking changes.

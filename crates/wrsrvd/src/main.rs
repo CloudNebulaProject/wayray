@@ -41,8 +41,8 @@ fn main() -> Result<()> {
     info!("wrsrvd starting");
 
     // Create the Wayland display.
-    let mut display = Display::<WayRay>::new()
-        .map_err(|e| errors::WayRayError::DisplayInit(Box::new(e)))?;
+    let mut display =
+        Display::<WayRay>::new().map_err(|e| errors::WayRayError::DisplayInit(Box::new(e)))?;
 
     // Initialize the Winit backend (opens a window, creates a GlesRenderer).
     let (backend, winit_event_loop) = winit::init::<GlesRenderer>().map_err(|e| {

@@ -1,9 +1,6 @@
 use smithay::{
     delegate_compositor, delegate_shm,
-    reexports::wayland_server::{
-        Client,
-        protocol::wl_surface::WlSurface,
-    },
+    reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
