@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Enable the Winit development backend (requires display server).
+# Build with: cargo build -p wrsrvd --features winit
+winit = ["smithay/renderer_gl", "smithay/backend_winit"]
+
 [dependencies]
 wayray-protocol.workspace = true
 tracing.workspace = true
@@ -11,16 +16,14 @@ tracing-subscriber.workspace = true
 miette.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-
-smithay = { version = "0.7", default-features = false, features = [
-    "wayland_frontend",
-    "desktop",
-    "renderer_gl",
-    "renderer_pixman",
-    "backend_winit",
-] }
 ctrlc = "3"
 quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
 tokio.workspace = true
+
+smithay = { version = "0.7", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+    "renderer_pixman",
+] }

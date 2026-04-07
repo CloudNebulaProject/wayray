@@ -75,10 +75,18 @@ fn main() -> Result<()> {
     );
 
     if use_winit {
-        let result = backend::winit::run(display, state, output);
-        net_handle.shutdown();
-        result
-    } else {
-        backend::headless::run(display, state, output, net_handle)
+        #[cfg(feature = "winit")]
+        {
+            let result = backend::winit::run(display, state, output);
+            net_handle.shutdown();
+            return result;
+        }
+        #[cfg(not(feature = "winit"))]
+        {
+            eprintln!("Winit backend not compiled. Build with: cargo build --features winit");
+            std::process::exit(1);
+        }
     }
+
+    backend::headless::run(display, state, output, net_handle)
 }

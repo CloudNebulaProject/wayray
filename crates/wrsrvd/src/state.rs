@@ -1,9 +1,10 @@
+#[cfg(feature = "winit")]
+use smithay::backend::input::{
+    AbsolutePositionEvent, Event as InputEventTrait, InputBackend, InputEvent, KeyboardKeyEvent,
+    PointerAxisEvent as PointerAxisEventTrait, PointerButtonEvent as PointerButtonEventTrait,
+};
 use smithay::{
-    backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event as InputEventTrait,
-        InputBackend, InputEvent, KeyboardKeyEvent, PointerAxisEvent as PointerAxisEventTrait,
-        PointerButtonEvent as PointerButtonEventTrait,
-    },
+    backend::input::{Axis, AxisSource, ButtonState},
     desktop::{Space, WindowSurfaceType},
     input::{
         Seat, SeatState,
@@ -82,6 +83,8 @@ impl WayRay {
 
     /// Process an input event from the backend and forward it to the appropriate
     /// Smithay seat device (keyboard or pointer).
+    /// Only used by the Winit backend for local input processing.
+    #[cfg(feature = "winit")]
     pub fn process_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
         match event {
             InputEvent::Keyboard { event } => {

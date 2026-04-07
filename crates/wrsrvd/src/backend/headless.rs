@@ -268,24 +268,6 @@ fn render_headless_frame(data: &mut CalloopData) {
                 std::slice::from_raw_parts(ptr, frame_bytes)
             };
 
-            // Debug: check if the framebuffer contains anything besides the clear color.
-            if element_count > 0 {
-                // Clear color [0.1, 0.1, 0.1, 1.0] ≈ [25, 25, 25, 255] in u8
-                // Count unique non-bg BGRA values in first 1000 pixels
-                let unique: std::collections::HashSet<[u8; 4]> = pixels
-                    .chunks_exact(4)
-                    .take(1000)
-                    .map(|p| [p[0], p[1], p[2], p[3]])
-                    .collect();
-                tracing::info!(
-                    unique_colors = unique.len(),
-                    first_pixel = ?&pixels[..4.min(pixels.len())],
-                    stride,
-                    total_bytes = pixels.len(),
-                    "framebuffer content check"
-                );
-            }
-
             // Send frame over network if a client is connected.
             if data.client_connected {
                 send_frame_to_network(data, pixels, &damage, output_size.w, output_size.h, stride);
