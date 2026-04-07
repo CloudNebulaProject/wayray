@@ -246,8 +246,10 @@ impl Display {
 
     /// Upload framebuffer pixel data to the GPU texture.
     ///
-    /// `pixel_data` is ARGB8888 format from the server (PixmanRenderer).
-    /// This method converts to BGRA8 for the GPU texture.
+    /// `pixel_data` is ARGB8888 from the server (PixmanRenderer on
+    /// little-endian x86). In memory this is `[B, G, R, A]` per pixel,
+    /// which matches wgpu's `Bgra8Unorm` layout directly — no conversion
+    /// needed.
     pub fn update_frame(&self, pixel_data: &[u8]) {
         let expected = (self.width * self.height * 4) as usize;
         if pixel_data.len() != expected {
@@ -258,18 +260,9 @@ impl Display {
             return;
         }
 
-        // Convert ARGB8888 → BGRA8: [A,R,G,B] → [B,G,R,A]
-        let mut bgra = Vec::with_capacity(pixel_data.len());
-        for pixel in pixel_data.chunks_exact(4) {
-            bgra.push(pixel[3]); // B
-            bgra.push(pixel[2]); // G
-            bgra.push(pixel[1]); // R
-            bgra.push(pixel[0]); // A
-        }
-
         self.queue.write_texture(
             self.frame_texture.as_image_copy(),
-            &bgra,
+            pixel_data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(self.width * 4),
