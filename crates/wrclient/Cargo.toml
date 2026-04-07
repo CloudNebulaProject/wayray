@@ -13,6 +13,10 @@ serde.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 tokio.workspace = true
+winit = "0.30"
+wgpu = "24"
+env_logger = "0.11"
+pollster = "0.4"
 
 [dev-dependencies]
 rcgen.workspace = true
