@@ -24,9 +24,12 @@ use smithay::{
     wayland::{compositor::CompositorClientState, socket::ListeningSocketSource},
 };
 use tracing::{info, warn};
+use wayray_protocol::encoding;
+use wayray_protocol::messages::FrameUpdate;
 
 use crate::errors::WayRayError;
 use crate::handlers::ClientState;
+use crate::network::{CompositorToNet, NetToCompositor, NetworkHandle};
 use crate::state::WayRay;
 
 /// Dark grey clear color for the compositor background.
@@ -39,13 +42,26 @@ struct CalloopData {
     renderer: PixmanRenderer,
     render_buffer: pixman_lib::Image<'static, 'static>,
     damage_tracker: OutputDamageTracker,
+    /// Network handle for sending frames and receiving input.
+    net_handle: NetworkHandle,
+    /// Previous frame's pixel data for XOR diff encoding.
+    previous_frame: Vec<u8>,
+    /// Frame sequence counter.
+    frame_sequence: u64,
+    /// Whether a remote client is currently connected.
+    client_connected: bool,
 }
 
 /// Run the compositor with the headless PixmanRenderer backend.
 ///
 /// This creates a CPU-only software renderer suitable for headless servers
 /// with no display hardware.
-pub fn run(display: Display<WayRay>, mut state: WayRay, output: Output) -> Result<()> {
+pub fn run(
+    display: Display<WayRay>,
+    mut state: WayRay,
+    output: Output,
+    net_handle: NetworkHandle,
+) -> Result<()> {
     // Create the PixmanRenderer (CPU software renderer).
     let mut renderer = PixmanRenderer::new().map_err(|e| {
         WayRayError::BackendInit(Box::<dyn std::error::Error + Send + Sync>::from(
@@ -117,12 +133,20 @@ pub fn run(display: Display<WayRay>, mut state: WayRay, output: Output) -> Resul
     // Map the output into the compositor space.
     state.space.map_output(&output, (0, 0));
 
+    // Initialize previous frame buffer (all zeros = black).
+    let frame_size = (output_size.w * output_size.h * 4) as usize;
+    let previous_frame = vec![0u8; frame_size];
+
     let mut calloop_data = CalloopData {
         state,
         display,
         renderer,
         render_buffer,
         damage_tracker,
+        net_handle,
+        previous_frame,
+        frame_sequence: 0,
+        client_connected: false,
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -134,6 +158,9 @@ pub fn run(display: Display<WayRay>, mut state: WayRay, output: Output) -> Resul
     info!("entering headless main event loop");
 
     while running.load(Ordering::SeqCst) {
+        // Drain network events (input from remote clients, connection state).
+        drain_network_events(&mut calloop_data);
+
         // Dispatch Wayland clients.
         calloop_data
             .display
@@ -152,7 +179,42 @@ pub fn run(display: Display<WayRay>, mut state: WayRay, output: Output) -> Resul
     }
 
     info!("headless backend shutting down");
+    calloop_data.net_handle.shutdown();
     Ok(())
+}
+
+/// Drain all pending network events (input, connection changes).
+fn drain_network_events(data: &mut CalloopData) {
+    use std::sync::mpsc::TryRecvError;
+
+    loop {
+        match data.net_handle.rx.try_recv() {
+            Ok(NetToCompositor::Input(input_msg)) => {
+                data.state.inject_network_input(input_msg);
+            }
+            Ok(NetToCompositor::ClientConnected(hello)) => {
+                info!(
+                    version = hello.version,
+                    capabilities = ?hello.capabilities,
+                    "remote client connected"
+                );
+                data.client_connected = true;
+            }
+            Ok(NetToCompositor::ClientDisconnected) => {
+                info!("remote client disconnected");
+                data.client_connected = false;
+            }
+            Ok(NetToCompositor::Control(ctrl)) => {
+                tracing::debug!(?ctrl, "received control message");
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                warn!("network channel disconnected");
+                data.client_connected = false;
+                break;
+            }
+        }
+    }
 }
 
 /// Render a single frame using the headless PixmanRenderer.
@@ -197,14 +259,16 @@ fn render_headless_frame(data: &mut CalloopData) {
             {
                 Ok(mapping) => match data.renderer.map_texture(&mapping) {
                     Ok(pixels) => {
-                        let damage_rects = damage.as_ref().map(|d| d.len()).unwrap_or(0);
-                        tracing::debug!(
-                            width = output_size.w,
-                            height = output_size.h,
-                            bytes = pixels.len(),
-                            damage_rects,
-                            "headless framebuffer captured"
-                        );
+                        // Send frame over network if a client is connected.
+                        if data.client_connected {
+                            send_frame_to_network(
+                                data,
+                                pixels,
+                                &damage,
+                                output_size.w,
+                                output_size.h,
+                            );
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to map headless framebuffer");
@@ -227,6 +291,77 @@ fn render_headless_frame(data: &mut CalloopData) {
             warn!(?err, "headless damage tracker render failed");
         }
     }
+}
+
+/// Encode the current frame as XOR diff against the previous frame and
+/// send it to the connected client via the network channel.
+fn send_frame_to_network(
+    data: &mut CalloopData,
+    current_pixels: &[u8],
+    damage: &Option<Vec<Rectangle<i32, smithay::utils::Physical>>>,
+    width: i32,
+    height: i32,
+) {
+    let stride = width as usize * 4;
+
+    // Compute XOR diff.
+    let diff = encoding::xor_diff(current_pixels, &data.previous_frame);
+
+    // Encode damaged regions. If damage tracking reports specific rects, use those;
+    // otherwise encode the full frame as a single region.
+    let regions: Vec<_> = match damage {
+        Some(rects) if !rects.is_empty() => rects
+            .iter()
+            .map(|rect| {
+                encoding::encode_region(
+                    &diff,
+                    stride,
+                    rect.loc.x.max(0) as u32,
+                    rect.loc.y.max(0) as u32,
+                    (rect.size.w.min(width - rect.loc.x.max(0))).max(0) as u32,
+                    (rect.size.h.min(height - rect.loc.y.max(0))).max(0) as u32,
+                )
+            })
+            .filter(|r| r.width > 0 && r.height > 0)
+            .collect(),
+        _ => {
+            // Full-frame update.
+            vec![encoding::encode_region(
+                &diff,
+                stride,
+                0,
+                0,
+                width as u32,
+                height as u32,
+            )]
+        }
+    };
+
+    data.frame_sequence += 1;
+    let frame_update = FrameUpdate {
+        sequence: data.frame_sequence,
+        regions,
+    };
+
+    tracing::debug!(
+        sequence = data.frame_sequence,
+        regions = frame_update.regions.len(),
+        "sending frame to client"
+    );
+
+    if data
+        .net_handle
+        .tx
+        .send(CompositorToNet::SendFrame(frame_update))
+        .is_err()
+    {
+        warn!("failed to send frame to network thread");
+        data.client_connected = false;
+    }
+
+    // Store current frame as previous for next diff.
+    data.previous_frame.clear();
+    data.previous_frame.extend_from_slice(current_pixels);
 }
 
 /// Install a Ctrl-C handler that sets the running flag to false.

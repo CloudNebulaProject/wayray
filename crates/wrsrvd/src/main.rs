@@ -4,6 +4,7 @@ mod handlers;
 pub mod network;
 mod state;
 
+use crate::network::{ServerConfig, start_server};
 use crate::state::WayRay;
 use miette::Result;
 use smithay::{
@@ -59,14 +60,25 @@ fn main() -> Result<()> {
     // Create compositor state.
     let state = WayRay::new(&mut display, output.clone());
 
+    // Start the QUIC network server for remote client connections.
+    let output_size = mode.size;
+    let net_handle = start_server(ServerConfig {
+        output_width: output_size.w as u32,
+        output_height: output_size.h as u32,
+        ..ServerConfig::default()
+    });
+    info!("QUIC network server started");
+
     info!(
         backend = if use_winit { "winit" } else { "headless" },
         "dispatching to backend"
     );
 
     if use_winit {
-        backend::winit::run(display, state, output)
+        let result = backend::winit::run(display, state, output);
+        net_handle.shutdown();
+        result
     } else {
-        backend::headless::run(display, state, output)
+        backend::headless::run(display, state, output, net_handle)
     }
 }
