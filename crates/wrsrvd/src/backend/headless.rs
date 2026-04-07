@@ -232,19 +232,9 @@ fn render_headless_frame(data: &mut CalloopData) {
         }
     };
 
-    let element_count = data.state.space.elements().count();
-    tracing::debug!(element_count, "render tick");
-
-    // Check if window toplevel has been configured.
-    if element_count > 0 {
-        for window in data.state.space.elements() {
-            if let Some(toplevel) = window.toplevel() {
-                let configured = toplevel.is_initial_configure_sent();
-                let bbox = window.bbox();
-                tracing::info!(configured, ?bbox, "window state");
-            }
-        }
-    }
+    // Refresh the space — updates output-to-element mappings.
+    // Must be called each frame before rendering.
+    data.state.space.refresh();
 
     let custom_elements: &[TextureRenderElement<PixmanTexture>] = &[];
 
@@ -278,14 +268,6 @@ fn render_headless_frame(data: &mut CalloopData) {
                 let ptr = data.render_buffer.data() as *const u8;
                 std::slice::from_raw_parts(ptr, frame_bytes)
             };
-
-            // One-shot content check for debugging.
-            if element_count > 0 {
-                let non_bg = pixels.chunks_exact(4).any(|p| p != [25, 25, 25, 255]);
-                if non_bg {
-                    tracing::info!("client surface rendered successfully");
-                }
-            }
 
             // Send frame over network if a client is connected.
             if data.client_connected {

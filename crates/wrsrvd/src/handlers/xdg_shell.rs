@@ -21,11 +21,16 @@ impl XdgShellHandler for WayRay {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Send the initial configure so the client can start drawing.
+        // Set a suggested size and send the initial configure so the
+        // client can start drawing.
+        surface.with_pending_state(|state| {
+            state.size = Some((800, 600).into());
+        });
         surface.send_configure();
+
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), false);
-        info!("new toplevel mapped");
+        self.space.map_element(window, (0, 0), true);
+        info!("new toplevel mapped with suggested size 800x600");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

@@ -8,7 +8,6 @@ use smithay::{
         shm::{ShmHandler, ShmState},
     },
 };
-use tracing::trace;
 
 use crate::state::WayRay;
 
@@ -40,21 +39,24 @@ impl CompositorHandler for WayRay {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        trace!(?surface, "surface commit");
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
-        // If this surface belongs to an xdg toplevel that hasn't received
-        // its initial configure yet, send it now so the client can start
-        // drawing.
+        // Find the window this surface belongs to and update its state.
         if let Some(window) = self
             .space
             .elements()
             .find(|w| w.wl_surface().map(|s| s.into_owned()) == Some(surface.clone()))
             .cloned()
-            && let Some(toplevel) = window.toplevel()
-            && !toplevel.is_initial_configure_sent()
         {
-            toplevel.send_configure();
+            // Update the window's bounding box from the committed surface tree.
+            // Without this, the window stays at 0x0 and never gets rendered.
+            window.on_commit();
+
+            if let Some(toplevel) = window.toplevel()
+                && !toplevel.is_initial_configure_sent()
+            {
+                toplevel.send_configure();
+            }
         }
     }
 }
