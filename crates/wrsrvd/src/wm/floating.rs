@@ -3,6 +3,14 @@ use std::collections::HashMap;
 use super::WindowManager;
 use super::types::{DecorationMode, ManageResponse, RenderCommand, WindowId, WindowInfo, ZOrder};
 
+/// Modifier bitmask for Alt (Mod1 in X11/XKB terms).
+pub const MOD_ALT: u32 = 0x08;
+
+/// Linux evdev keycode for F4.
+pub const KEY_F4: u32 = 62;
+/// Linux evdev keycode for Tab.
+pub const KEY_TAB: u32 = 15;
+
 /// State for a single managed window in the floating WM.
 #[derive(Debug, Clone)]
 struct WindowState {
@@ -37,6 +45,32 @@ impl BuiltinFloatingWm {
             output_width,
             output_height,
         }
+    }
+
+    /// Get the currently focused window (top of focus stack).
+    pub fn focused(&self) -> Option<WindowId> {
+        self.focus_stack.last().copied()
+    }
+
+    /// Cycle focus to the next window in the stack.
+    /// Returns the newly focused window id, if any.
+    pub fn focus_next(&mut self) -> Option<WindowId> {
+        if self.focus_stack.len() < 2 {
+            return self.focus_stack.last().copied();
+        }
+
+        // Move the top (focused) window to the bottom of the stack.
+        let top = self.focus_stack.pop().unwrap();
+        self.focus_stack.insert(0, top);
+
+        // The new top is now focused — raise it.
+        let new_focus = *self.focus_stack.last().unwrap();
+        if let Some(state) = self.windows.get_mut(&new_focus) {
+            state.z_index = self.next_z;
+            self.next_z += 1;
+        }
+
+        Some(new_focus)
     }
 
     /// Move window to the top of the focus stack.
@@ -125,9 +159,25 @@ impl WindowManager for BuiltinFloatingWm {
             .collect()
     }
 
-    fn on_key_binding(&mut self, _key: u32, _modifiers: u32) -> bool {
-        // TODO: Alt+F4 close, Alt+Tab cycle
-        false
+    fn on_key_binding(&mut self, key: u32, modifiers: u32) -> bool {
+        if modifiers & MOD_ALT == 0 {
+            return false;
+        }
+
+        match key {
+            KEY_F4 => {
+                // Alt+F4: signal that the focused window should close.
+                // The actual close is handled by the compositor via
+                // the returned `true` + checking focused().
+                true
+            }
+            KEY_TAB => {
+                // Alt+Tab: cycle focus to the next window.
+                self.focus_next();
+                true
+            }
+            _ => false,
+        }
     }
 
     fn on_pointer_focus(&mut self, id: WindowId) -> Option<WindowId> {
@@ -227,5 +277,55 @@ mod tests {
         assert!(granted);
         assert_eq!(wm.windows[&id].position, (0, 0));
         assert_eq!(wm.windows[&id].size, (1280, 720));
+    }
+
+    #[test]
+    fn alt_f4_signals_close() {
+        let mut wm = BuiltinFloatingWm::new(1280, 720);
+        let id = WindowId::from_raw(1);
+        wm.on_new_toplevel(id, make_info());
+
+        // Alt+F4 should be consumed.
+        assert!(wm.on_key_binding(KEY_F4, MOD_ALT));
+        // The focused window should still exist (compositor handles actual close).
+        assert_eq!(wm.focused(), Some(id));
+    }
+
+    #[test]
+    fn alt_tab_cycles_focus() {
+        let mut wm = BuiltinFloatingWm::new(1280, 720);
+        let id1 = WindowId::from_raw(1);
+        let id2 = WindowId::from_raw(2);
+        let id3 = WindowId::from_raw(3);
+
+        wm.on_new_toplevel(id1, make_info());
+        wm.on_new_toplevel(id2, make_info());
+        wm.on_new_toplevel(id3, make_info());
+
+        assert_eq!(wm.focused(), Some(id3));
+
+        // Alt+Tab should cycle to id2.
+        assert!(wm.on_key_binding(KEY_TAB, MOD_ALT));
+        assert_eq!(wm.focused(), Some(id2));
+
+        // Again -> id1.
+        assert!(wm.on_key_binding(KEY_TAB, MOD_ALT));
+        assert_eq!(wm.focused(), Some(id1));
+
+        // Again -> back to id3.
+        assert!(wm.on_key_binding(KEY_TAB, MOD_ALT));
+        assert_eq!(wm.focused(), Some(id3));
+    }
+
+    #[test]
+    fn non_alt_keys_not_consumed() {
+        let mut wm = BuiltinFloatingWm::new(1280, 720);
+        let id = WindowId::from_raw(1);
+        wm.on_new_toplevel(id, make_info());
+
+        // F4 without Alt should not be consumed.
+        assert!(!wm.on_key_binding(KEY_F4, 0));
+        // Random key with Alt should not be consumed.
+        assert!(!wm.on_key_binding(42, MOD_ALT));
     }
 }

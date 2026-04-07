@@ -283,6 +283,39 @@ impl WayRay {
     pub fn inject_network_input(&mut self, msg: InputMessage) {
         match msg {
             InputMessage::Keyboard(ev) => {
+                let pressed = matches!(ev.state, wayray_protocol::messages::KeyState::Pressed);
+
+                // Check if an external WM wants this key.
+                if let Some(proto) = &self.wm_state.protocol
+                    && proto.check_key_binding(ev.keycode, 0, pressed)
+                {
+                    return;
+                }
+
+                // Check if the built-in WM wants this key (only on press).
+                if pressed && self.wm_state.active_wm().on_key_binding(ev.keycode, 0) {
+                    // Alt+F4: close the focused window.
+                    if ev.keycode == crate::wm::floating::KEY_F4
+                        && let Some(focused) = self.wm_state.builtin.focused()
+                        && let Some(window) = self.window_for_id(focused).cloned()
+                        && let Some(toplevel) = window.toplevel()
+                    {
+                        toplevel.send_close();
+                    }
+                    // Alt+Tab: focus the next window.
+                    if ev.keycode == crate::wm::floating::KEY_TAB
+                        && let Some(new_focus) = self.wm_state.builtin.focused()
+                        && let Some(window) = self.window_for_id(new_focus).cloned()
+                    {
+                        self.space.raise_element(&window, true);
+                        let serial = SERIAL_COUNTER.next_serial();
+                        let keyboard = self.seat.get_keyboard().unwrap();
+                        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
+                        keyboard.set_focus(self, wl_surface, serial);
+                    }
+                    return;
+                }
+
                 let serial = SERIAL_COUNTER.next_serial();
                 let keyboard = self.seat.get_keyboard().unwrap();
                 let state = match ev.state {

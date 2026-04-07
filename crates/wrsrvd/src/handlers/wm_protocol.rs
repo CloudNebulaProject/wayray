@@ -2,9 +2,15 @@
 //!
 //! Connects the generated protocol types to our WmProtocolState implementation.
 
-use smithay::reexports::wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::ClientId,
+use smithay::reexports::{
+    wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as SmithayDecorationMode,
+    wayland_protocols::xdg::shell::server::xdg_toplevel,
+    wayland_server::{
+        Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::ClientId,
+    },
 };
+use smithay::utils::SERIAL_COUNTER;
+use tracing::warn;
 use wayray_wm_protocol::server::{
     wayray_wm_manager_v1::WayrayWmManagerV1, wayray_wm_seat_v1::WayrayWmSeatV1,
     wayray_wm_window_v1::WayrayWmWindowV1, wayray_wm_workspace_v1::WayrayWmWorkspaceV1,
@@ -12,6 +18,7 @@ use wayray_wm_protocol::server::{
 
 use crate::state::WayRay;
 use crate::wm::protocol::{WmGlobalData, WmProtocolHandler, WmProtocolState, WmWindowData};
+use crate::wm::types::DecorationMode;
 
 impl WmProtocolHandler for WayRay {
     fn wm_protocol_state(&mut self) -> &mut WmProtocolState {
@@ -30,6 +37,75 @@ impl WmProtocolHandler for WayRay {
                 Some((*id, None, None, size.w, size.h))
             })
             .collect()
+    }
+
+    fn configure_window(&mut self, id: crate::wm::types::WindowId, width: i32, height: i32) {
+        let Some(window) = self.window_for_id(id).cloned() else {
+            warn!(?id, "configure_window: unknown window");
+            return;
+        };
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.size = Some((width, height).into());
+            });
+            toplevel.send_pending_configure();
+        }
+    }
+
+    fn focus_window(&mut self, id: crate::wm::types::WindowId) {
+        let Some(window) = self.window_for_id(id).cloned() else {
+            warn!(?id, "focus_window: unknown window");
+            return;
+        };
+        self.space.raise_element(&window, true);
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
+        keyboard.set_focus(self, wl_surface, serial);
+    }
+
+    fn close_window(&mut self, id: crate::wm::types::WindowId) {
+        let Some(window) = self.window_for_id(id).cloned() else {
+            warn!(?id, "close_window: unknown window");
+            return;
+        };
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.send_close();
+        }
+    }
+
+    fn set_fullscreen(&mut self, id: crate::wm::types::WindowId, granted: bool) {
+        let Some(window) = self.window_for_id(id).cloned() else {
+            warn!(?id, "set_fullscreen: unknown window");
+            return;
+        };
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                if granted {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                } else {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                }
+            });
+            toplevel.send_pending_configure();
+        }
+    }
+
+    fn set_decoration(&mut self, id: crate::wm::types::WindowId, mode: DecorationMode) {
+        let Some(window) = self.window_for_id(id).cloned() else {
+            warn!(?id, "set_decoration: unknown window");
+            return;
+        };
+        if let Some(toplevel) = window.toplevel() {
+            let smithay_mode = match mode {
+                DecorationMode::ServerSide => SmithayDecorationMode::ServerSide,
+                DecorationMode::ClientSide => SmithayDecorationMode::ClientSide,
+            };
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = Some(smithay_mode);
+            });
+            toplevel.send_pending_configure();
+        }
     }
 }
 

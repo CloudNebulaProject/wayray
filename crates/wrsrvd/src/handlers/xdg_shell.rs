@@ -62,6 +62,37 @@ impl XdgShellHandler for WayRay {
             pos = ?response.position,
             "new toplevel mapped via WM"
         );
+
+        // Notify external WM if connected, triggering a manage phase.
+        if let Some(proto) = &mut self.wm_state.protocol
+            && proto.is_wm_connected()
+        {
+            proto.notify_new_window::<WayRay>(id, None, None, response.size.0, response.size.1);
+            proto.start_manage_phase();
+        }
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Find and remove the window from our tracking.
+        let wl_surface = surface.wl_surface();
+        if let Some(pos) = self.window_ids.iter().position(|(_, w)| {
+            w.toplevel()
+                .map(|t| t.wl_surface() == wl_surface)
+                .unwrap_or(false)
+        }) {
+            let (id, window) = self.window_ids.remove(pos);
+            self.wm_state.active_wm().on_close_toplevel(id);
+            self.space.unmap_elem(&window);
+
+            // Notify external WM if connected.
+            if let Some(proto) = &mut self.wm_state.protocol
+                && proto.is_wm_connected()
+            {
+                proto.notify_window_closed(id);
+            }
+
+            info!(?id, "toplevel destroyed");
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

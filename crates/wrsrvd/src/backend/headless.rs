@@ -238,7 +238,36 @@ fn render_headless_frame(data: &mut CalloopData) {
     data.state.space.refresh();
 
     // Apply WM render phase — positions/z-order before frame capture.
-    data.state.apply_wm_render_commands();
+    // If an external WM is connected, trigger the render phase protocol
+    // and apply its commands instead of the built-in WM's.
+    if let Some(proto) = &mut data.state.wm_state.protocol {
+        if proto.is_wm_connected() {
+            proto.start_render_phase();
+            // Note: The external WM responds via protocol dispatch in the
+            // next display.dispatch_clients() call. For this frame, apply
+            // any commands accumulated from previous dispatches.
+            let commands = proto.take_render_commands();
+            for cmd in commands {
+                if let Some(window) = data
+                    .state
+                    .window_ids
+                    .iter()
+                    .find(|(id, _)| *id == cmd.id)
+                    .map(|(_, w)| w.clone())
+                {
+                    if cmd.visible {
+                        data.state.space.map_element(window, cmd.position, false);
+                    } else {
+                        data.state.space.unmap_elem(&window);
+                    }
+                }
+            }
+        } else {
+            data.state.apply_wm_render_commands();
+        }
+    } else {
+        data.state.apply_wm_render_commands();
+    }
 
     let custom_elements: &[TextureRenderElement<PixmanTexture>] = &[];
 

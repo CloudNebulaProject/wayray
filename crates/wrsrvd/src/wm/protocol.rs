@@ -3,7 +3,7 @@
 //! Implements `GlobalDispatch` and `Dispatch` for the four custom WM interfaces,
 //! allowing external WM clients to connect and control window layout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
@@ -17,7 +17,7 @@ use wayray_wm_protocol::server::{
     wayray_wm_workspace_v1::{self, WayrayWmWorkspaceV1},
 };
 
-use super::types::{RenderCommand, WindowId, ZOrder};
+use super::types::{DecorationMode, RenderCommand, WindowId, ZOrder};
 
 /// Window info tuple for sending to a newly connected WM.
 /// (window_id, title, app_id, width, height)
@@ -51,6 +51,14 @@ pub struct WmProtocolState {
     render_phase_active: bool,
     /// Display handle for creating resources.
     dh: DisplayHandle,
+    /// Registered keybindings: (key, modifiers, mode) -> active.
+    keybindings: HashSet<(u32, u32, String)>,
+    /// Available binding modes.
+    binding_modes: HashSet<String>,
+    /// Currently active binding mode (empty string = default).
+    active_mode: String,
+    /// The WM's seat object for sending binding events.
+    wm_seat: Option<WayrayWmSeatV1>,
 }
 
 impl std::fmt::Debug for WmProtocolState {
@@ -84,6 +92,10 @@ impl WmProtocolState {
             manage_phase_active: false,
             render_phase_active: false,
             dh: dh.clone(),
+            keybindings: HashSet::new(),
+            binding_modes: HashSet::new(),
+            active_mode: String::new(),
+            wm_seat: None,
         }
     }
 
@@ -169,6 +181,32 @@ impl WmProtocolState {
         std::mem::take(&mut self.pending_render_commands)
     }
 
+    /// Check if a key+modifiers combination is registered as a WM binding.
+    /// If so, send the binding_pressed event to the WM and return true.
+    pub fn check_key_binding(&self, key: u32, modifiers: u32, pressed: bool) -> bool {
+        // Check default mode bindings and active mode bindings.
+        let default_match = self.keybindings.contains(&(key, modifiers, String::new()));
+        let mode_match = !self.active_mode.is_empty()
+            && self
+                .keybindings
+                .contains(&(key, modifiers, self.active_mode.clone()));
+
+        if !default_match && !mode_match {
+            return false;
+        }
+
+        // Send binding event to the WM's seat object.
+        if let Some(seat) = &self.wm_seat {
+            if pressed {
+                seat.binding_pressed(key, modifiers);
+            } else {
+                seat.binding_released(key, modifiers);
+            }
+        }
+
+        true
+    }
+
     /// Send the full window list to a newly connected WM.
     fn send_full_window_list<D>(
         &mut self,
@@ -234,6 +272,23 @@ pub trait WmProtocolHandler:
     /// Return the list of existing windows for sending to a newly connected WM.
     /// Each tuple is (window_id, title, app_id, width, height).
     fn existing_windows(&self) -> Vec<WindowSnapshot>;
+
+    // -- Compositor actions: let protocol dispatch reach back into Smithay --
+
+    /// Send a configure with proposed dimensions to the window's toplevel.
+    fn configure_window(&mut self, id: WindowId, width: i32, height: i32);
+
+    /// Move keyboard focus to the specified window.
+    fn focus_window(&mut self, id: WindowId);
+
+    /// Ask the client to close the specified window.
+    fn close_window(&mut self, id: WindowId);
+
+    /// Set or unset fullscreen state on a window.
+    fn set_fullscreen(&mut self, id: WindowId, granted: bool);
+
+    /// Set the decoration mode (server-side or client-side) for a window.
+    fn set_decoration(&mut self, id: WindowId, mode: DecorationMode);
 }
 
 // --- Manager ---
@@ -314,6 +369,9 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmManagerV1, (), D> for WmProtocolStat
             proto.window_objects.clear();
             proto.manage_phase_active = false;
             proto.render_phase_active = false;
+            proto.keybindings.clear();
+            proto.wm_seat = None;
+            proto.active_mode.clear();
             info!("external WM disconnected");
         }
     }
@@ -331,34 +389,46 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
-        let proto = state.wm_protocol_state();
         let window_id = data.window_id;
 
+        // Manage-phase requests: call compositor actions directly on state.
+        // These need &mut access to the full compositor, not just the protocol state.
         match request {
-            wayray_wm_window_v1::Request::ProposeDimensions {
-                width: _,
-                height: _,
-            } => {
-                // TODO: implement dimension proposal tracking
+            wayray_wm_window_v1::Request::ProposeDimensions { width, height } => {
+                state.configure_window(window_id, width, height);
+                return;
             }
             wayray_wm_window_v1::Request::SetFocus => {
-                // TODO: queue focus change
+                state.focus_window(window_id);
+                return;
             }
             wayray_wm_window_v1::Request::UseSsd => {
-                // TODO: set decoration mode
+                state.set_decoration(window_id, DecorationMode::ServerSide);
+                return;
             }
             wayray_wm_window_v1::Request::UseCsd => {
-                // TODO: set decoration mode
+                state.set_decoration(window_id, DecorationMode::ClientSide);
+                return;
             }
             wayray_wm_window_v1::Request::GrantFullscreen => {
-                // TODO: grant fullscreen
+                state.set_fullscreen(window_id, true);
+                return;
             }
             wayray_wm_window_v1::Request::DenyFullscreen => {
-                // TODO: deny fullscreen
+                state.set_fullscreen(window_id, false);
+                return;
             }
             wayray_wm_window_v1::Request::Close => {
-                // TODO: send close to toplevel
+                state.close_window(window_id);
+                return;
             }
+            _ => {}
+        }
+
+        // Render-phase requests: accumulate into pending render commands.
+        let proto = state.wm_protocol_state();
+
+        match request {
             wayray_wm_window_v1::Request::SetPosition { x, y } => {
                 proto.pending_render_commands.push(RenderCommand {
                     id: window_id,
@@ -368,7 +438,6 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
                 });
             }
             wayray_wm_window_v1::Request::SetZTop => {
-                // Update the last command for this window, or add a new one.
                 if let Some(cmd) = proto
                     .pending_render_commands
                     .iter_mut()
@@ -378,7 +447,7 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
                 } else {
                     proto.pending_render_commands.push(RenderCommand {
                         id: window_id,
-                        position: (0, 0), // Will use existing position
+                        position: (0, 0),
                         z_order: ZOrder::Top,
                         visible: true,
                     });
@@ -399,15 +468,6 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
                         visible: true,
                     });
                 }
-            }
-            wayray_wm_window_v1::Request::SetZAbove { .. } => {
-                // TODO: relative z-ordering
-            }
-            wayray_wm_window_v1::Request::SetZBelow { .. } => {
-                // TODO: relative z-ordering
-            }
-            wayray_wm_window_v1::Request::SetBorders { .. } => {
-                // TODO: border rendering
             }
             wayray_wm_window_v1::Request::Show => {
                 if let Some(cmd) = proto
@@ -441,8 +501,15 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
                     });
                 }
             }
+            wayray_wm_window_v1::Request::SetZAbove { .. }
+            | wayray_wm_window_v1::Request::SetZBelow { .. } => {
+                // TODO: relative z-ordering (needs sibling window lookup)
+            }
+            wayray_wm_window_v1::Request::SetBorders { .. } => {
+                // TODO: border rendering
+            }
             wayray_wm_window_v1::Request::SetOutput { .. } => {
-                // TODO: multi-output
+                // TODO: multi-output support
             }
             wayray_wm_window_v1::Request::Destroy => {}
             _ => {}
@@ -466,31 +533,42 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
 
 impl<D: WmProtocolHandler> Dispatch<WayrayWmSeatV1, (), D> for WmProtocolState {
     fn request(
-        _state: &mut D,
+        state: &mut D,
         _client: &Client,
-        _resource: &WayrayWmSeatV1,
+        resource: &WayrayWmSeatV1,
         request: wayray_wm_seat_v1::Request,
         _data: &(),
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
+        let proto = state.wm_protocol_state();
+
+        // Store the seat object for sending binding events later.
+        if proto.wm_seat.is_none() {
+            proto.wm_seat = Some(resource.clone());
+        }
+
         match request {
             wayray_wm_seat_v1::Request::BindKey {
                 key,
                 modifiers,
                 mode,
             } => {
-                // TODO: register keybinding
+                proto.keybindings.insert((key, modifiers, mode.clone()));
                 info!(key, modifiers, mode, "WM registered keybinding");
             }
-            wayray_wm_seat_v1::Request::UnbindKey { .. } => {
-                // TODO: unregister keybinding
+            wayray_wm_seat_v1::Request::UnbindKey {
+                key,
+                modifiers,
+                mode,
+            } => {
+                proto.keybindings.remove(&(key, modifiers, mode));
             }
-            wayray_wm_seat_v1::Request::CreateMode { .. } => {
-                // TODO: create binding mode
+            wayray_wm_seat_v1::Request::CreateMode { name } => {
+                proto.binding_modes.insert(name);
             }
-            wayray_wm_seat_v1::Request::ActivateMode { .. } => {
-                // TODO: activate binding mode
+            wayray_wm_seat_v1::Request::ActivateMode { name } => {
+                proto.active_mode = name;
             }
             wayray_wm_seat_v1::Request::StartMove { .. } => {
                 // TODO: interactive move
@@ -498,7 +576,10 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmSeatV1, (), D> for WmProtocolState {
             wayray_wm_seat_v1::Request::StartResize { .. } => {
                 // TODO: interactive resize
             }
-            wayray_wm_seat_v1::Request::Destroy => {}
+            wayray_wm_seat_v1::Request::Destroy => {
+                proto.wm_seat = None;
+                proto.keybindings.clear();
+            }
             _ => {}
         }
     }
