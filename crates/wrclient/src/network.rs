@@ -12,7 +12,7 @@
 //! The handshake protocol accounts for this by having each side write
 //! data before the other side tries to accept.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use quinn::rustls::pki_types::CertificateDer;
 use tracing::info;
@@ -23,16 +23,46 @@ use wayray_protocol::messages::{
 
 /// Configuration for the QUIC client connection.
 pub struct ClientConfig {
-    /// Server address to connect to.
+    /// Server address to connect to (IP:port or hostname:port).
     pub server_addr: SocketAddr,
+    /// Hostname for TLS SNI (used in QUIC connect).
+    pub server_name: String,
     /// Client capabilities to advertise in the hello.
     pub capabilities: Vec<String>,
+}
+
+/// Resolve a "host:port" string to a SocketAddr, supporting both
+/// IP addresses and DNS hostnames.
+pub fn resolve_server_addr(addr_str: &str) -> Result<(SocketAddr, String), String> {
+    // Try parsing as a direct SocketAddr first (e.g., "192.168.1.1:4433").
+    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+        return Ok((addr, "localhost".to_string()));
+    }
+
+    // Otherwise treat as hostname:port and resolve via DNS.
+    let addrs: Vec<SocketAddr> = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve '{}': {}", addr_str, e))?
+        .collect();
+
+    let addr = addrs
+        .first()
+        .ok_or_else(|| format!("no addresses found for '{}'", addr_str))?;
+
+    // Extract hostname (everything before the last ':port').
+    let hostname = addr_str
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| addr_str.to_string());
+
+    Ok((*addr, hostname))
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             server_addr: "127.0.0.1:4433".parse().unwrap(),
+            server_name: "localhost".to_string(),
             capabilities: vec!["display".to_string()],
         }
     }
@@ -171,7 +201,9 @@ pub async fn connect(
     endpoint.set_default_client_config(client_config);
 
     info!(server = %config.server_addr, "connecting to wrsrvd");
-    let connection = endpoint.connect(config.server_addr, "localhost")?.await?;
+    let connection = endpoint
+        .connect(config.server_addr, &config.server_name)?
+        .await?;
     info!("QUIC connection established");
 
     // Open control stream (bidirectional) and immediately send ClientHello.
@@ -319,6 +351,7 @@ mod tests {
 
         let config = ClientConfig {
             server_addr: addr,
+            server_name: "localhost".to_string(),
             capabilities: vec!["test".to_string()],
         };
 
@@ -371,6 +404,7 @@ mod tests {
 
         let config = ClientConfig {
             server_addr: addr,
+            server_name: "localhost".to_string(),
             capabilities: vec![],
         };
 

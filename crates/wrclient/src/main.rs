@@ -8,7 +8,6 @@ pub mod display;
 pub mod input;
 pub mod network;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -192,17 +191,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    let server_addr: SocketAddr = match args[1].parse() {
-        Ok(addr) => addr,
+    let (server_addr, server_name) = match network::resolve_server_addr(&args[1]) {
+        Ok(result) => result,
         Err(e) => {
             eprintln!("Invalid server address '{}': {}", args[1], e);
             std::process::exit(1);
         }
     };
 
-    // Connect to the server to get dimensions before creating the window.
-    // This initial handshake runs on a temporary tokio runtime.
-    info!(server = %server_addr, "connecting to server");
+    info!(server = %server_addr, name = %server_name, "connecting to server");
 
     let (frame_tx, frame_rx) = mpsc::channel::<FrameData>();
     let (input_tx, input_rx) = mpsc::channel::<InputMessage>();
@@ -223,6 +220,7 @@ fn main() {
             rt.block_on(async move {
                 let config = ClientConfig {
                     server_addr,
+                    server_name,
                     capabilities: vec!["display".to_string()],
                 };
 
