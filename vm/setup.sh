@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # WayRay VM Provisioning Script
-# Run as a regular user inside a fresh Arch Linux aarch64 install.
+# Run as a regular user inside an Ubuntu 22.04 aarch64 VM (UTM gallery image).
 # Idempotent — safe to run multiple times.
 
 set -euo pipefail
 
-REPO_URL="${1:-}"
+REPO_URL="${1:-https://github.com/CloudNebulaProject/wayray.git}"
 WAYRAY_DIR="$HOME/wayray"
 
 info() { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -15,43 +15,56 @@ ok()   { printf '\033[1;32m==> %s\033[0m\n' "$*"; }
 # ── 1. System packages ───────────────────────────────────────────────
 
 info "Updating system packages..."
-sudo pacman -Syu --noconfirm
+sudo apt-get update
+sudo apt-get upgrade -y
 
 PACKAGES=(
     # Build tools
-    base-devel
+    build-essential
+    pkg-config
+    cmake
 
     # Wayland
-    wayland
+    libwayland-dev
     wayland-protocols
-    libxkbcommon
+    libxkbcommon-dev
 
     # Graphics (Mesa provides EGL/OpenGL for Winit's GlesRenderer)
-    mesa
+    libgles2-mesa-dev
+    libegl1-mesa-dev
+    libgbm-dev
+    libdrm-dev
 
     # Session
     sway
-    seatd
     foot
+    seatd
 
     # Tools
     git
-    openssh
+    curl
+    openssh-client
 )
 
 info "Installing packages..."
-sudo pacman -S --needed --noconfirm "${PACKAGES[@]}"
+sudo apt-get install -y "${PACKAGES[@]}"
 
 # ── 2. Services ──────────────────────────────────────────────────────
 
 info "Enabling seatd..."
-sudo systemctl enable --now seatd
+sudo systemctl enable --now seatd || true
 
 # Add user to seat group if not already a member.
-if ! groups | grep -q '\bseat\b'; then
+if getent group seat &>/dev/null && ! groups | grep -q '\bseat\b'; then
     info "Adding $USER to seat group..."
     sudo usermod -aG seat "$USER"
     warn "Group change requires re-login. Re-run this script after reboot."
+fi
+
+# Some Ubuntu setups need the user in video group for GPU access.
+if ! groups | grep -q '\bvideo\b'; then
+    info "Adding $USER to video group..."
+    sudo usermod -aG video "$USER"
 fi
 
 # ── 3. Rust toolchain ────────────────────────────────────────────────
@@ -65,11 +78,15 @@ else
     source "$HOME/.cargo/env"
 fi
 
+# Make cargo available in this session if .cargo/env exists.
+# shellcheck disable=SC1091
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+
 # Verify edition 2024 support (Rust 1.85+).
-RUST_VERSION=$(rustc --version | grep -oP '\d+\.\d+')
+RUST_VERSION=$(rustc --version | sed -n 's/rustc \([0-9]*\.[0-9]*\).*/\1/p')
 RUST_MAJOR=$(echo "$RUST_VERSION" | cut -d. -f1)
 RUST_MINOR=$(echo "$RUST_VERSION" | cut -d. -f2)
-if (( RUST_MAJOR < 1 || (RUST_MAJOR == 1 && RUST_MINOR < 85) )); then
+if [ "$RUST_MAJOR" -lt 1 ] || { [ "$RUST_MAJOR" -eq 1 ] && [ "$RUST_MINOR" -lt 85 ]; }; then
     warn "Rust $RUST_VERSION may not support edition 2024. Run: rustup update"
 fi
 
@@ -78,15 +95,7 @@ fi
 if [ -d "$WAYRAY_DIR" ]; then
     ok "WayRay repo already cloned at $WAYRAY_DIR"
 else
-    if [ -z "$REPO_URL" ]; then
-        echo ""
-        echo "WayRay repo URL not provided."
-        echo "Usage: $0 <git-repo-url>"
-        echo "Example: $0 https://github.com/user/wayray.git"
-        echo "         $0 git@github.com:user/wayray.git"
-        exit 1
-    fi
-    info "Cloning WayRay..."
+    info "Cloning WayRay from $REPO_URL..."
     git clone "$REPO_URL" "$WAYRAY_DIR"
 fi
 
@@ -106,13 +115,13 @@ else
     sudo tee "$GETTY_OVERRIDE" > /dev/null <<EOF
 [Service]
 ExecStart=
-ExecStart=-/usr/bin/agetty --autologin $USER --noclear %I \$TERM
+ExecStart=-/sbin/agetty --autologin $USER --noclear %I \$TERM
 EOF
     sudo systemctl daemon-reload
 fi
 
 # Start Sway on TTY1 login (only if not already in a graphical session).
-PROFILE="$HOME/.bash_profile"
+PROFILE="$HOME/.profile"
 SWAY_LAUNCH='[ "$(tty)" = "/dev/tty1" ] && exec sway'
 if ! grep -qF 'exec sway' "$PROFILE" 2>/dev/null; then
     info "Adding Sway auto-start to $PROFILE..."

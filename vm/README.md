@@ -1,7 +1,7 @@
 # WayRay VM Testing Setup
 
-Visual testing environment for the WayRay compositor using an Arch Linux
-aarch64 VM on macOS Apple Silicon via UTM.
+Visual testing environment for the WayRay compositor using an Ubuntu
+22.04 aarch64 VM on macOS Apple Silicon via UTM.
 
 ## Prerequisites
 
@@ -10,60 +10,40 @@ aarch64 VM on macOS Apple Silicon via UTM.
 
 ## Create the VM
 
-### 1. Download the Arch Linux ARM ISO
+### 1. Get the Ubuntu 22.04 image from the UTM Gallery
 
-Go to <https://archlinux.org/download/> and download the latest aarch64
-ISO image.
+1. Open UTM
+2. Click **+** to create a new VM
+3. Select **Browse UTM Gallery...**
+4. Find and download **Ubuntu 22.04**
+5. The VM is pre-configured with reasonable defaults
 
-### 2. Create a new VM in UTM
+### 2. Adjust VM settings (optional)
 
-1. Open UTM, click **Create a New Virtual Machine**
-2. Select **Virtualize**
-3. Select **Linux**
-4. Browse to the downloaded ISO
-5. Configure hardware:
-   - **CPU:** 4 cores
+The gallery image works out of the box, but for faster Rust compilation:
+
+1. Select the VM in UTM, click the **settings icon**
+2. Under **System**:
+   - **CPU:** 4 cores (or more)
    - **RAM:** 8192 MB (8 GB)
-6. Configure storage:
-   - **Disk size:** 30 GB
-7. Give it a name (e.g., "WayRay Dev")
-8. Click **Save**
 
-The VM defaults to VirtIO display and shared networking, which is what
-we need.
+### 3. Boot and run the setup script
 
-### 3. Install Arch Linux
-
-1. Boot the VM from the ISO
-2. Run `archinstall`
-3. Recommended settings:
-   - **Mirrors:** Select your region
-   - **Disk configuration:** Use entire disk, ext4
-   - **Bootloader:** systemd-boot
-   - **Profile:** Minimal
-   - **User:** Create a user with sudo privileges
-   - **Network:** NetworkManager
-4. Complete the installation and reboot
-5. Remove the ISO from the VM's CD drive in UTM settings
-
-### 4. Run the setup script
-
-Boot into the installed system and log in, then:
+1. Start the VM and log in (gallery image credentials are shown in UTM)
+2. Open a terminal and run:
 
 ```bash
-# Install git first (needed to clone the repo)
-sudo pacman -S git --noconfirm
-
 # Clone WayRay and run the setup script
-git clone <your-wayray-repo-url> ~/wayray
+git clone https://github.com/CloudNebulaProject/wayray.git ~/wayray
 bash ~/wayray/vm/setup.sh
 
 # Reboot to apply auto-login and start Sway
 sudo reboot
 ```
 
-Note: the script skips cloning if `~/wayray` already exists, so passing
-the repo URL to `setup.sh` is only needed if you haven't cloned yet.
+The setup script installs all dependencies (Wayland libs, Mesa, Sway,
+Rust), builds WayRay, and configures auto-login into a minimal Sway
+session.
 
 ## Testing the Compositor
 
@@ -103,29 +83,40 @@ A foot terminal should appear inside the wrsrvd window. You can:
 
 ### Sway fails to start
 
-If Sway fails with a GPU error, the VirtIO GPU may not be working
-with Apple Virtualization.framework. Try switching UTM to QEMU backend:
+If Sway fails with a GPU or seat error:
+
+```bash
+# Check seatd is running
+systemctl status seatd
+
+# Check group membership (need seat and video)
+groups
+
+# If missing, add and reboot
+sudo usermod -aG seat,video $USER
+sudo reboot
+```
+
+If the VirtIO GPU isn't working, try switching UTM to QEMU backend:
 
 1. Shut down the VM
-2. In UTM, edit the VM settings
+2. Edit VM settings
 3. Under **System**, uncheck "Use Apple Virtualization"
-4. Under **Display**, ensure VirtIO GPU is selected
-5. Boot again
+4. Boot again
 
 ### Black screen after reboot
 
-The auto-login or Sway autostart may have failed. Switch to TTY2 with
-`Ctrl+Alt+F2`, log in, and check:
+Switch to TTY2 with `Ctrl+Alt+F2`, log in, and check:
 
 ```bash
-# Check if seatd is running
-systemctl status seatd
-
-# Check if user is in seat group
-groups
-
 # Try starting Sway manually
 sway
+
+# Check the auto-login override
+cat /etc/systemd/system/getty@tty1.service.d/override.conf
+
+# Check .profile for Sway launch
+tail ~/.profile
 ```
 
 ### Build fails
@@ -139,4 +130,13 @@ rustc --version
 
 # Retry
 cargo build --workspace
+```
+
+### Missing Wayland/EGL libraries
+
+If `cargo build` fails with missing `-lwayland-client` or EGL errors:
+
+```bash
+# Reinstall dev packages
+sudo apt-get install -y libwayland-dev libegl1-mesa-dev libgles2-mesa-dev libxkbcommon-dev
 ```
