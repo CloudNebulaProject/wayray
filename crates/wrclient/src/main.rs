@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use wayray_protocol::messages::InputMessage;
@@ -102,12 +102,10 @@ impl ApplicationHandler for App {
         );
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Use Poll mode so the event loop continuously checks for new frames
-        // instead of blocking until user input arrives.
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Drain any pending frames from the network thread.
+        // The network thread wakes us via EventLoopProxy when frames arrive,
+        // so we don't need to busy-poll.
         let mut got_frame = false;
         while let Ok(frame) = self.frame_rx.try_recv() {
             if let Some(display) = &self.display {
@@ -116,6 +114,22 @@ impl ApplicationHandler for App {
             }
         }
 
+        if got_frame && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // Woken by the network thread — new frame available.
+        // The actual frame processing happens in about_to_wait.
+        // Just request a redraw check.
+        let mut got_frame = false;
+        while let Ok(frame) = self.frame_rx.try_recv() {
+            if let Some(display) = &self.display {
+                display.update_frame(&frame.pixels);
+                got_frame = true;
+            }
+        }
         if got_frame && let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -214,10 +228,18 @@ fn main() {
     // dimensions back before entering its frame-receive loop.
     let (dim_tx, dim_rx) = mpsc::channel::<(u32, u32)>();
 
+    // Create the event loop early so we can get a proxy for cross-thread wake.
+    let event_loop = EventLoop::<()>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
+    let proxy: EventLoopProxy<()> = event_loop.create_proxy();
+
     // Spawn the network thread with its own tokio runtime.
+    let net_proxy = proxy.clone();
     std::thread::Builder::new()
         .name("wrclient-network".into())
         .spawn(move || {
+            let proxy = net_proxy;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -312,6 +334,9 @@ fn main() {
                                 break;
                             }
 
+                            // Wake the winit event loop to process the new frame.
+                            let _ = proxy.send_event(());
+
                             // Acknowledge the frame.
                             if let Err(e) = conn.send_frame_ack(update.sequence).await {
                                 warn!(error = %e, "failed to send frame ack");
@@ -342,7 +367,8 @@ fn main() {
     info!(width, height, "starting display");
 
     // Run the winit event loop on the main thread.
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    // The event loop was created earlier (before spawning the network thread)
+    // so we could pass an EventLoopProxy to wake it on new frames.
     let mut app = App::new(width, height, frame_rx, input_tx);
     event_loop.run_app(&mut app).expect("event loop error");
 }
