@@ -169,10 +169,9 @@ impl Launcher {
     }
 }
 
-/// Default socket path for the launcher.
+/// Default IPC path for the launcher (uses shared transport default).
 fn default_socket_path() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(runtime_dir).join("wayray-launcher.sock")
+    wayray_protocol::transport::default_ipc_path()
 }
 
 #[tokio::main]
