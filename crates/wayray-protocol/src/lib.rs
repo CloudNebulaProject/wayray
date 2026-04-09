@@ -6,7 +6,9 @@
 
 pub mod codec;
 pub mod encoding;
+pub mod launcher;
 pub mod messages;
+pub mod session_config;
 
 /// Current protocol version. Incremented on breaking changes.
 pub const PROTOCOL_VERSION: u32 = 1;

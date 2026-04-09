@@ -8,4 +8,7 @@ license.workspace = true
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 zstd.workspace = true
+toml = "0.8"
+serde_json = "1"

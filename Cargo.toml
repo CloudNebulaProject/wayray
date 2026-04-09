@@ -7,6 +7,8 @@ members = [
     "crates/wrclient",
     "crates/wradm",
     "crates/wr-wm-tiling",
+    "crates/wrsessd",
+    "crates/wrlogin",
 ]
 
 [workspace.package]
