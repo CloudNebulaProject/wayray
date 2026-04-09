@@ -71,6 +71,7 @@ mod tests {
         let msg = ControlMessage::ClientHello(ClientHello {
             version: 1,
             capabilities: vec!["display".to_string()],
+            token: Some("test".to_string()),
         });
         let encoded = encode(&msg).unwrap();
         let (len, payload) = read_length_prefix(&encoded).unwrap();

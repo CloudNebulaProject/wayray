@@ -253,13 +253,15 @@ async fn handle_connection(
         return Err(format!("expected ClientHello, got {client_hello:?}").into());
     };
     info!(version = hello.version, "received ClientHello");
+    let token = hello.token.clone().unwrap_or_default();
     let _ = compositor_tx.send(NetToCompositor::ClientConnected(hello));
-
     let server_hello = ControlMessage::ServerHello(ServerHello {
         version: wayray_protocol::PROTOCOL_VERSION,
-        session_id: 1, // TODO: real session management
+        session_id: 1, // Assigned by session registry in task 3
         output_width: config.output_width,
         output_height: config.output_height,
+        resumed: false,
+        token,
     });
     write_message(&mut control_send, &server_hello).await?;
     info!("sent ServerHello");
@@ -473,6 +475,8 @@ mod tests {
                 session_id: 42,
                 output_width: 1920,
                 output_height: 1080,
+                resumed: false,
+                token: "test-token".to_string(),
             });
             write_message(&mut control_send, &server_hello)
                 .await
@@ -497,6 +501,7 @@ mod tests {
         let client_hello = ControlMessage::ClientHello(ClientHello {
             version: wayray_protocol::PROTOCOL_VERSION,
             capabilities: vec!["display".to_string()],
+            token: Some("test-token".to_string()),
         });
         write_message(&mut control_send, &client_hello)
             .await
@@ -538,6 +543,8 @@ mod tests {
                 session_id: 1,
                 output_width: 1280,
                 output_height: 720,
+                resumed: false,
+                token: String::new(),
             });
             write_message(&mut control_send, &server_hello)
                 .await
@@ -572,6 +579,7 @@ mod tests {
         let client_hello = ControlMessage::ClientHello(ClientHello {
             version: wayray_protocol::PROTOCOL_VERSION,
             capabilities: vec![],
+            token: None,
         });
         write_message(&mut control_send, &client_hello)
             .await

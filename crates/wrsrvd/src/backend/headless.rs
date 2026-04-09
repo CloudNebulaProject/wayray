@@ -30,6 +30,7 @@ use wayray_protocol::messages::FrameUpdate;
 use crate::errors::WayRayError;
 use crate::handlers::ClientState;
 use crate::network::{CompositorToNet, NetToCompositor, NetworkHandle};
+use crate::session::{SessionRegistry, SessionState, SessionToken};
 use crate::state::WayRay;
 
 /// Dark grey clear color for the compositor background.
@@ -50,6 +51,10 @@ struct CalloopData {
     frame_sequence: u64,
     /// Whether a remote client is currently connected.
     client_connected: bool,
+    /// Session registry tracking all sessions by token.
+    session_registry: SessionRegistry,
+    /// The currently active session ID (if any).
+    active_session: Option<crate::session::SessionId>,
 }
 
 /// Run the compositor with the headless PixmanRenderer backend.
@@ -149,6 +154,8 @@ pub fn run(
         previous_frame,
         frame_sequence: 0,
         client_connected: false,
+        session_registry: SessionRegistry::new(),
+        active_session: None,
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -159,9 +166,21 @@ pub fn run(
 
     info!("entering headless main event loop");
 
+    let mut cleanup_counter: u32 = 0;
+
     while running.load(Ordering::SeqCst) {
         // Drain network events (input from remote clients, connection state).
         drain_network_events(&mut calloop_data);
+
+        // Periodically clean up expired suspended sessions (~every 60s at 60fps).
+        cleanup_counter += 1;
+        if cleanup_counter >= 3600 {
+            cleanup_counter = 0;
+            let expired = calloop_data.session_registry.cleanup_expired();
+            if !expired.is_empty() {
+                calloop_data.session_registry.purge_destroyed();
+            }
+        }
 
         // Dispatch Wayland clients.
         calloop_data
@@ -196,15 +215,53 @@ fn drain_network_events(data: &mut CalloopData) {
                 data.state.inject_network_input(input_msg);
             }
             Ok(NetToCompositor::ClientConnected(hello)) => {
+                let token_str = hello.token.clone().unwrap_or_else(|| {
+                    // Generate a token if the client didn't provide one.
+                    format!("auto-{}", data.session_registry.list().count() + 1)
+                });
+                let token = SessionToken::new(token_str);
+
+                // Look up existing session or create new one.
+                let (session_id, resumed) =
+                    if let Some(existing) = data.session_registry.find_by_token(&token) {
+                        let id = existing.id;
+                        let was_suspended = existing.state == SessionState::Suspended;
+                        if was_suspended {
+                            if let Err(e) = data.session_registry.activate(id) {
+                                warn!(error = %e, "failed to resume session");
+                            } else {
+                                info!(%id, "session resumed");
+                            }
+                        }
+                        (id, was_suspended)
+                    } else {
+                        let id = data.session_registry.create_session(token.clone());
+                        if let Err(e) = data.session_registry.activate(id) {
+                            warn!(error = %e, "failed to activate new session");
+                        }
+                        (id, false)
+                    };
+
+                data.active_session = Some(session_id);
+                data.client_connected = true;
+
                 info!(
                     version = hello.version,
-                    capabilities = ?hello.capabilities,
+                    %session_id,
+                    resumed,
+                    %token,
                     "remote client connected"
                 );
-                data.client_connected = true;
             }
             Ok(NetToCompositor::ClientDisconnected) => {
-                info!("remote client disconnected");
+                // Suspend the session instead of destroying it.
+                if let Some(session_id) = data.active_session.take() {
+                    if let Err(e) = data.session_registry.suspend(session_id) {
+                        warn!(error = %e, "failed to suspend session");
+                    } else {
+                        info!(%session_id, "session suspended, waiting for reconnect");
+                    }
+                }
                 data.client_connected = false;
             }
             Ok(NetToCompositor::Control(ctrl)) => {

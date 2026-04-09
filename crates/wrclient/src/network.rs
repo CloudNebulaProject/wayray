@@ -29,6 +29,8 @@ pub struct ClientConfig {
     pub server_name: String,
     /// Client capabilities to advertise in the hello.
     pub capabilities: Vec<String>,
+    /// Session token for session binding. If None, no token is sent.
+    pub token: Option<String>,
 }
 
 /// Resolve a "host:port" string to a SocketAddr, supporting both
@@ -64,6 +66,7 @@ impl Default for ClientConfig {
             server_addr: "127.0.0.1:4433".parse().unwrap(),
             server_name: "localhost".to_string(),
             capabilities: vec!["display".to_string()],
+            token: None,
         }
     }
 }
@@ -214,6 +217,7 @@ pub async fn connect(
     let client_hello = ControlMessage::ClientHello(ClientHello {
         version: wayray_protocol::PROTOCOL_VERSION,
         capabilities: config.capabilities.clone(),
+        token: config.token.clone(),
     });
     write_message(&mut control_send, &client_hello).await?;
     info!("sent ClientHello");
@@ -227,6 +231,8 @@ pub async fn connect(
                 session_id = hello.session_id,
                 width = hello.output_width,
                 height = hello.output_height,
+                resumed = hello.resumed,
+                token = %hello.token,
                 "received ServerHello"
             );
             hello
@@ -337,6 +343,8 @@ mod tests {
                 session_id: 99,
                 output_width: 1920,
                 output_height: 1080,
+                resumed: false,
+                token: String::new(),
             });
             write_message(&mut control_send, &server_hello)
                 .await
@@ -353,6 +361,7 @@ mod tests {
             server_addr: addr,
             server_name: "localhost".to_string(),
             capabilities: vec!["test".to_string()],
+            token: Some("test-token".to_string()),
         };
 
         let (_endpoint, mut conn) = connect(&config).await.unwrap();
@@ -381,6 +390,8 @@ mod tests {
                 session_id: 1,
                 output_width: 800,
                 output_height: 600,
+                resumed: false,
+                token: String::new(),
             });
             write_message(&mut control_send, &server_hello)
                 .await
@@ -406,6 +417,7 @@ mod tests {
             server_addr: addr,
             server_name: "localhost".to_string(),
             capabilities: vec![],
+            token: None,
         };
 
         let (_endpoint, mut conn) = connect(&config).await.unwrap();

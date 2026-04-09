@@ -2,6 +2,7 @@ mod backend;
 mod errors;
 mod handlers;
 pub mod network;
+pub mod session;
 mod state;
 mod wm;
 

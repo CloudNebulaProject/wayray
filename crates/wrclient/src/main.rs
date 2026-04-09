@@ -196,6 +196,48 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Load or generate a persistent session token.
+///
+/// Reads from `~/.config/wayray/token`. If the file doesn't exist,
+/// generates a random hex token and writes it.
+fn load_or_generate_token() -> String {
+    let config_dir = dirs_path().join("wayray");
+    let token_path = config_dir.join("token");
+
+    if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return token;
+        }
+    }
+
+    // Generate a random 16-byte hex token.
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("failed to generate random token");
+    let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+    // Persist it.
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        warn!(error = %e, "failed to create config dir");
+    } else if let Err(e) = std::fs::write(&token_path, &token) {
+        warn!(error = %e, "failed to persist token");
+    } else {
+        info!(path = %token_path.display(), "session token persisted");
+    }
+
+    token
+}
+
+/// Get the user's config directory base path.
+fn dirs_path() -> std::path::PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            std::path::PathBuf::from(home).join(".config")
+        })
+}
+
 fn main() {
     // Initialize tracing with RUST_LOG env filtering.
     tracing_subscriber::fmt()
@@ -206,20 +248,28 @@ fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: wrclient <host>:<port>");
-        std::process::exit(1);
-    }
 
-    let (server_addr, server_name) = match network::resolve_server_addr(&args[1]) {
+    // Parse: wrclient <host>:<port> [--token <token>]
+    let addr_arg = args.get(1).cloned().unwrap_or_else(|| {
+        eprintln!("Usage: wrclient <host>:<port> [--token <token>]");
+        std::process::exit(1);
+    });
+
+    let token = if let Some(pos) = args.iter().position(|a| a == "--token") {
+        args.get(pos + 1).cloned()
+    } else {
+        Some(load_or_generate_token())
+    };
+
+    let (server_addr, server_name) = match network::resolve_server_addr(&addr_arg) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("Invalid server address '{}': {}", args[1], e);
+            eprintln!("Invalid server address '{}': {}", addr_arg, e);
             std::process::exit(1);
         }
     };
 
-    info!(server = %server_addr, name = %server_name, "connecting to server");
+    info!(server = %server_addr, name = %server_name, token = ?token, "connecting to server");
 
     let (frame_tx, frame_rx) = mpsc::channel::<FrameData>();
     let (input_tx, input_rx) = mpsc::channel::<InputMessage>();
@@ -250,6 +300,7 @@ fn main() {
                     server_addr,
                     server_name,
                     capabilities: vec!["display".to_string()],
+                    token,
                 };
 
                 let (_endpoint, mut conn) = match network::connect(&config).await {

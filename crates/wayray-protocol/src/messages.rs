@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub struct ClientHello {
     pub version: u32,
     pub capabilities: Vec<String>,
+    /// Session token for session lookup/creation.
+    /// If None, the server creates a new session with a generated token.
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +22,35 @@ pub struct ServerHello {
     pub session_id: u64,
     pub output_width: u32,
     pub output_height: u32,
+    /// Whether this is a resumed session or a new one.
+    pub resumed: bool,
+    /// The token bound to this session (echoed back to the client).
+    pub token: String,
+}
+
+/// Session lifecycle state as seen by the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionStatus {
+    /// New session being created.
+    Creating,
+    /// Session is active.
+    Active,
+    /// Session was suspended and is being resumed.
+    Resuming,
+}
+
+/// Session-related control events sent by the server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SessionEvent {
+    /// Session state changed.
+    StateChanged {
+        session_id: u64,
+        status: SessionStatus,
+    },
+    /// Session is being suspended (client should prepare for disconnect).
+    Suspending { session_id: u64 },
+    /// Session has been destroyed (client should disconnect).
+    Destroyed { session_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +75,7 @@ pub enum ControlMessage {
     Ping(Ping),
     Pong(Pong),
     FrameAck(FrameAck),
+    SessionEvent(SessionEvent),
 }
 
 // ── Display channel (server → client, unidirectional) ───────────────
