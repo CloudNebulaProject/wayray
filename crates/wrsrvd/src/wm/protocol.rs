@@ -17,7 +17,7 @@ use wayray_wm_protocol::server::{
     wayray_wm_workspace_v1::{self, WayrayWmWorkspaceV1},
 };
 
-use super::types::{DecorationMode, RenderCommand, WindowId, ZOrder};
+use super::types::{DecorationMode, RenderCommand, WindowId, WorkspaceState, ZOrder};
 
 /// Window info tuple for sending to a newly connected WM.
 /// (window_id, title, app_id, width, height)
@@ -59,6 +59,11 @@ pub struct WmProtocolState {
     active_mode: String,
     /// The WM's seat object for sending binding events.
     wm_seat: Option<WayrayWmSeatV1>,
+    /// Workspace / tag visibility model.
+    workspace: WorkspaceState,
+    /// The bound workspace-manager resource, used to emit create/destroy
+    /// events and to resend the full workspace list on reconnect.
+    workspace_manager: Option<WayrayWmWorkspaceV1>,
 }
 
 impl std::fmt::Debug for WmProtocolState {
@@ -96,12 +101,26 @@ impl WmProtocolState {
             binding_modes: HashSet::new(),
             active_mode: String::new(),
             wm_seat: None,
+            workspace: WorkspaceState::default(),
+            workspace_manager: None,
         }
     }
 
     /// Whether an external WM is currently connected.
     pub fn is_wm_connected(&self) -> bool {
         self.wm_client.is_some()
+    }
+
+    /// Read-only access to the workspace / tag visibility model.
+    pub fn workspace(&self) -> &WorkspaceState {
+        &self.workspace
+    }
+
+    /// Whether a window is visible on the given output under the current
+    /// workspace / tag configuration. Used by the render path to filter
+    /// windows before mapping them into the Space.
+    pub fn workspace_visible(&self, id: WindowId, output: &str) -> bool {
+        self.workspace.is_visible(id, output)
     }
 
     /// Send a `window_new` event to the connected WM for a new toplevel.
@@ -353,7 +372,14 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmManagerV1, (), D> for WmProtocolStat
                 data_init.init(id, ());
             }
             wayray_wm_manager_v1::Request::GetWorkspaceManager { id } => {
-                data_init.init(id, ());
+                let instance = data_init.init(id, ());
+                // Resync: resend the full workspace list so a reconnecting WM
+                // observes workspaces created before it (re)bound.
+                for name in proto.workspace.workspaces.keys() {
+                    instance.workspace_created(name.clone());
+                }
+                proto.workspace_manager = Some(instance);
+                info!("WM bound workspace manager");
             }
             wayray_wm_manager_v1::Request::Destroy => {
                 // WM disconnecting gracefully.
@@ -589,7 +615,7 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmSeatV1, (), D> for WmProtocolState {
 
 impl<D: WmProtocolHandler> Dispatch<WayrayWmWorkspaceV1, (), D> for WmProtocolState {
     fn request(
-        _state: &mut D,
+        state: &mut D,
         _client: &Client,
         resource: &WayrayWmWorkspaceV1,
         request: wayray_wm_workspace_v1::Request,
@@ -597,26 +623,123 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWorkspaceV1, (), D> for WmProtocolSt
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
+        let proto = state.wm_protocol_state();
         match request {
             wayray_wm_workspace_v1::Request::CreateWorkspace { name } => {
-                // TODO: create workspace
+                info!(workspace = %name, "WM created workspace");
+                proto.workspace.create_workspace(name.clone());
                 resource.workspace_created(name);
             }
             wayray_wm_workspace_v1::Request::DestroyWorkspace { name } => {
-                // TODO: destroy workspace
+                info!(workspace = %name, "WM destroyed workspace");
+                proto.workspace.destroy_workspace(&name);
                 resource.workspace_destroyed(name);
             }
-            wayray_wm_workspace_v1::Request::SetActiveWorkspace { .. } => {
-                // TODO: set active workspace
+            wayray_wm_workspace_v1::Request::SetActiveWorkspace {
+                output_name,
+                workspace_name,
+            } => {
+                info!(output = %output_name, workspace = %workspace_name, "WM set active workspace");
+                // No event defined in the XML; visibility is recomputed next frame.
+                proto
+                    .workspace
+                    .set_active_workspace(output_name, workspace_name);
             }
-            wayray_wm_workspace_v1::Request::AssignWindow { .. } => {
-                // TODO: assign window to workspace
+            wayray_wm_workspace_v1::Request::AssignWindow {
+                window,
+                workspace_name,
+            } => {
+                if let Some(id) = proto.window_id_for_resource(&window) {
+                    info!(window = id.raw(), workspace = %workspace_name, "WM assigned window to workspace");
+                    proto.workspace.assign_window(id, workspace_name);
+                } else {
+                    warn!("assign_window for unknown window resource");
+                }
             }
-            wayray_wm_workspace_v1::Request::SetWindowTags { .. } => {
-                // TODO: set window tags
+            wayray_wm_workspace_v1::Request::SetWindowTags { window, tags } => {
+                if let Some(id) = proto.window_id_for_resource(&window) {
+                    info!(window = id.raw(), tags, "WM set window tags");
+                    proto.workspace.set_window_tags(id, tags);
+                } else {
+                    warn!("set_window_tags for unknown window resource");
+                }
             }
-            wayray_wm_workspace_v1::Request::Destroy => {}
+            wayray_wm_workspace_v1::Request::Destroy => {
+                // Keep workspace data so a reconnecting WM can resync; just
+                // drop the resource handle.
+                proto.workspace_manager = None;
+            }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::{DEFAULT_OUTPUT, WindowId, WorkspaceState};
+
+    /// Exercise the same workspace-state transitions the workspace Dispatch arms
+    /// perform (create_workspace / assign_window / set_active_workspace), and
+    /// assert visibility via `is_visible` (which backs `workspace_visible`).
+    #[test]
+    fn workspace_switch_changes_visible_window() {
+        let win1 = WindowId::from_raw(1);
+        let win2 = WindowId::from_raw(2);
+
+        let mut ws = WorkspaceState::default();
+
+        // create_workspace "a", create_workspace "b"
+        ws.create_workspace("a".to_string());
+        ws.create_workspace("b".to_string());
+
+        // assign_window(win1, "a"), assign_window(win2, "b")
+        ws.assign_window(win1, "a".to_string());
+        ws.assign_window(win2, "b".to_string());
+
+        // set_active_workspace(default_output, "a") -> only win1 visible
+        ws.set_active_workspace(DEFAULT_OUTPUT.to_string(), "a".to_string());
+        assert!(ws.is_visible(win1, DEFAULT_OUTPUT));
+        assert!(!ws.is_visible(win2, DEFAULT_OUTPUT));
+
+        // switch to "b" -> only win2 visible
+        ws.set_active_workspace(DEFAULT_OUTPUT.to_string(), "b".to_string());
+        assert!(!ws.is_visible(win1, DEFAULT_OUTPUT));
+        assert!(ws.is_visible(win2, DEFAULT_OUTPUT));
+    }
+
+    #[test]
+    fn destroying_active_workspace_unassigns_and_falls_back() {
+        let win1 = WindowId::from_raw(1);
+        let mut ws = WorkspaceState::default();
+        ws.create_workspace("a".to_string());
+        ws.create_workspace("b".to_string());
+        ws.assign_window(win1, "a".to_string());
+        ws.set_active_workspace(DEFAULT_OUTPUT.to_string(), "a".to_string());
+
+        ws.destroy_workspace("a");
+
+        // win1 is now unassigned -> always visible.
+        assert!(ws.is_visible(win1, DEFAULT_OUTPUT));
+        assert!(!ws.window_workspace.contains_key(&win1));
+        // Active fell back to the remaining workspace "b".
+        assert_eq!(ws.active.get(DEFAULT_OUTPUT).map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn assign_then_tag_is_mutually_exclusive() {
+        let win1 = WindowId::from_raw(1);
+        let mut ws = WorkspaceState::default();
+        ws.create_workspace("a".to_string());
+        ws.assign_window(win1, "a".to_string());
+        assert!(ws.window_workspace.contains_key(&win1));
+
+        // Setting tags clears the workspace assignment.
+        ws.set_window_tags(win1, 0b10);
+        assert!(!ws.window_workspace.contains_key(&win1));
+        assert_eq!(ws.window_tags.get(&win1).copied(), Some(0b10));
+
+        // Re-assigning a workspace clears the tags.
+        ws.assign_window(win1, "a".to_string());
+        assert!(!ws.window_tags.contains_key(&win1));
     }
 }

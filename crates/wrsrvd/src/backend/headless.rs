@@ -297,6 +297,9 @@ fn render_headless_frame(data: &mut CalloopData) {
     // Apply WM render phase — positions/z-order before frame capture.
     // If an external WM is connected, trigger the render phase protocol
     // and apply its commands instead of the built-in WM's.
+    // Output name drives per-output workspace visibility. Computed once here so
+    // it can be used while `proto` is mutably borrowed below.
+    let output_name = data.state.output.name();
     if let Some(proto) = &mut data.state.wm_state.protocol {
         if proto.is_wm_connected() {
             proto.start_render_phase();
@@ -304,7 +307,16 @@ fn render_headless_frame(data: &mut CalloopData) {
             // next display.dispatch_clients() call. For this frame, apply
             // any commands accumulated from previous dispatches.
             let commands = proto.take_render_commands();
-            for cmd in commands {
+            // Snapshot workspace visibility per command id while `proto` is
+            // borrowed, then apply to the Space.
+            let resolved: Vec<_> = commands
+                .into_iter()
+                .map(|cmd| {
+                    let visible = cmd.visible && proto.workspace_visible(cmd.id, &output_name);
+                    (cmd, visible)
+                })
+                .collect();
+            for (cmd, visible) in resolved {
                 if let Some(window) = data
                     .state
                     .window_ids
@@ -312,7 +324,7 @@ fn render_headless_frame(data: &mut CalloopData) {
                     .find(|(id, _)| *id == cmd.id)
                     .map(|(_, w)| w.clone())
                 {
-                    if cmd.visible {
+                    if visible {
                         data.state.space.map_element(window, cmd.position, false);
                     } else {
                         data.state.space.unmap_elem(&window);

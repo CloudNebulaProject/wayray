@@ -24,6 +24,8 @@ struct WindowState {
 /// Central state for the tiling WM client.
 struct TilingWm {
     manager: Option<WayrayWmManagerV1>,
+    /// Workspace manager handle (for creating/activating workspaces).
+    workspace: Option<WayrayWmWorkspaceV1>,
     windows: Vec<WindowState>,
     /// Output dimensions (set from output_new event).
     output_width: i32,
@@ -38,6 +40,7 @@ impl TilingWm {
     fn new() -> Self {
         Self {
             manager: None,
+            workspace: None,
             windows: Vec::new(),
             output_width: 1280,
             output_height: 720,
@@ -319,6 +322,18 @@ fn main() {
     }
 
     info!("connected to WayRay compositor, entering event loop");
+
+    // Set up a default workspace so the workspace protocol path is exercised.
+    if let Some(manager) = &state.manager {
+        let workspace = manager.get_workspace_manager(&qh, ());
+        workspace.create_workspace("main".to_string());
+        workspace.set_active_workspace("wayray-0".to_string(), "main".to_string());
+        state.workspace = Some(workspace);
+        info!("created and activated default workspace 'main'");
+    }
+    event_queue
+        .roundtrip(&mut state)
+        .expect("workspace setup roundtrip failed");
 
     loop {
         event_queue

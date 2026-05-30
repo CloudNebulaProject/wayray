@@ -135,17 +135,29 @@ impl WayRay {
 
     /// Apply WM render commands to the Space before frame rendering.
     pub fn apply_wm_render_commands(&mut self) {
+        let output_name = self.output.name();
         let ids: Vec<_> = self.window_ids.iter().map(|(id, _)| *id).collect();
         let commands = self.wm_state.active_wm().on_render(&ids);
 
         for cmd in commands {
+            // Apply workspace/tag visibility filtering when a protocol WM state
+            // exists. The built-in WM assigns no workspaces/tags, so unassigned
+            // windows stay visible (is_visible returns true) and behavior is
+            // unchanged.
+            let visible = cmd.visible
+                && self
+                    .wm_state
+                    .protocol
+                    .as_ref()
+                    .is_none_or(|p| p.workspace_visible(cmd.id, &output_name));
+
             if let Some(window) = self
                 .window_ids
                 .iter()
                 .find(|(id, _)| *id == cmd.id)
                 .map(|(_, w)| w.clone())
             {
-                if cmd.visible {
+                if visible {
                     self.space.map_element(window, cmd.position, false);
                 } else {
                     self.space.unmap_elem(&window);
