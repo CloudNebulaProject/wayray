@@ -1,0 +1,96 @@
+name: CI
+
+# Solstice CI runs every job in a dedicated VM that is freshly bootstrapped via
+# cloud-init for each run. It registers as a native runner on Forgejo and reads
+# this standard Actions YAML. A few things differ from GitHub Actions:
+#   * No `uses:` steps. The repository is auto-cloned and the working directory
+#     is the repo root, so there is no `actions/checkout`.
+#   * No `actions/cache` — builds are cold every run. (Future: pre-bake a wayray
+#     image with the toolchain + deps via refraction-forger to cut build time.)
+#   * The OS images do not ship a Rust toolchain; each job installs it.
+# Docs: https://code.aopc.cloud/CloudNebulaProject/solstice-ci (User Book).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Primary gate — format, lint, test and release-build the whole workspace on
+  # Linux. This is the cheap, fast signal that everything else hangs off.
+  linux-gate:
+    name: Linux gate (fmt / clippy / test / build)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build dependencies
+        # The headless core uses the pixman renderer; wrclient uses winit + wgpu,
+        # so the Wayland / X11 / xkbcommon / pixman / EGL+GLES development headers
+        # are all required to link the release build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libpixman-1-dev \
+            libudev-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev
+
+      - name: Install Rust toolchain
+        # The ubuntu-22.04 image does not pre-install rustup, so bootstrap it from
+        # the upstream installer and expose it to later steps via $GITHUB_PATH.
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal \
+                --component rustfmt clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+  # illumos is the PRIMARY target. This job's whole reason to exist is compiling
+  # the `doors` IPC path, which only builds on illumos and is therefore invisible
+  # to the Linux job above. Gated behind linux-gate so a change that already fails
+  # fmt/clippy/test/build does not spend a scarce illumos VM.
+  illumos-doors:
+    name: illumos (OmniOS) — doors path
+    runs-on: omnios-bloody
+    needs: [linux-gate]
+    steps:
+      - name: Install toolchain (gcc + Rust)
+        # gcc14, gnu-make and system/header (which provides <sys/door.h>) are
+        # pre-baked into the image; Rust is not. OmniOS ships Rust via the ooce
+        # publisher, with the upstream rustup installer as a fallback. `pkg
+        # install` exits 4 when packages are already current, so tolerate that.
+        run: |
+          pkg install -v --accept developer/gcc14 ooce/developer/rust || true
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal || true
+          fi
+          echo "/opt/ooce/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Compile portable core (+ tests)
+        run: cargo test -p wayray-protocol --locked
+
+      - name: Compile doors IPC path
+        # The doors crate only compiles on illumos, so this is the unique coverage
+        # the GitHub-Actions stopgap could never give us with a native runner.
+        run: |
+          cargo check -p wayray-protocol --features doors --locked
+          cargo check -p wrsessd --features doors --locked
