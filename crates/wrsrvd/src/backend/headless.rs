@@ -268,8 +268,19 @@ fn drain_network_events(data: &mut CalloopData) {
 
                 // Multi-server affinity: if this token's session is known to
                 // live on another server, redirect the client there instead of
-                // creating a duplicate local session.
-                if let SessionLocation::Remote(server_id) = data.session_registry.locate(&token) {
+                // creating a duplicate local session. When the token is not
+                // known locally and we are clustered, probe peers on demand to
+                // discover whether one of them hosts the session (and cache the
+                // answer in the registry's remote map).
+                let mut location = data.session_registry.locate(&token);
+                if location == SessionLocation::Unknown
+                    && let Some(server_id) = discover_remote_home(data, &token)
+                {
+                    data.session_registry
+                        .note_remote_session(token.clone(), server_id.clone());
+                    location = SessionLocation::Remote(server_id);
+                }
+                if let SessionLocation::Remote(server_id) = location {
                     if let Some(addr) = data.cluster.addr_of(&server_id) {
                         info!(%token, %server_id, %addr, "redirecting client to home server");
                         let _ = reply.send(ConnectDecision::Redirect {
@@ -332,11 +343,10 @@ fn drain_network_events(data: &mut CalloopData) {
                 data.active_session = Some(session_id);
                 data.client_connected = true;
 
-                // Publish the live active-session count so peer ServerInfo
-                // queries report an accurate load for balancing.
-                data.net_handle.set_active_sessions(
-                    data.session_registry.count_by_state(SessionState::Active) as u32,
-                );
+                // Publish the live active-session count and resumable token set
+                // so peer ServerInfo / SessionLookup queries see an accurate
+                // load and session location.
+                publish_cluster_state(data);
 
                 // Reply to the network thread with the resolved binding so it
                 // can compose an accurate ServerHello.
@@ -370,10 +380,11 @@ fn drain_network_events(data: &mut CalloopData) {
                     }
                 }
                 data.client_connected = false;
-                // Refresh the published active count for peer load queries.
-                data.net_handle.set_active_sessions(
-                    data.session_registry.count_by_state(SessionState::Active) as u32,
-                );
+                // Refresh the published load/location state for peer queries.
+                // A suspended session is still resumable, so it stays in the
+                // published token set and a reconnecting client elsewhere is
+                // redirected home.
+                publish_cluster_state(data);
             }
             Ok(NetToCompositor::Control(ctrl)) => {
                 tracing::debug!(?ctrl, "received control message");
@@ -386,6 +397,53 @@ fn drain_network_events(data: &mut CalloopData) {
             }
         }
     }
+}
+
+/// Publish this server's current load and resumable-token set to the network
+/// thread so peers get accurate answers to `ServerInfo` and `SessionLookup`
+/// probes. Cheap; called whenever session state changes.
+fn publish_cluster_state(data: &CalloopData) {
+    data.net_handle
+        .set_active_sessions(data.session_registry.count_by_state(SessionState::Active) as u32);
+    data.net_handle
+        .set_local_tokens(data.session_registry.resumable_tokens());
+}
+
+/// Probe cluster peers to find which one (if any) hosts a resumable session for
+/// `token`. Returns the home server's id on the first positive answer.
+///
+/// Only runs in a real cluster; single-server deployments and unconfigured
+/// peers short-circuit to `None`. This is the runtime data source that
+/// populates the registry's remote-session map so a server receiving a client
+/// for a token it does not host can redirect to the session's home server
+/// instead of creating a duplicate.
+fn discover_remote_home(data: &CalloopData, token: &SessionToken) -> Option<String> {
+    if !data.cluster.is_clustered() {
+        return None;
+    }
+    let rt = data.peer_rt.as_ref()?;
+
+    let candidates: Vec<(String, String)> = data
+        .cluster
+        .peers()
+        .map(|s| (s.id.clone(), s.addr.clone()))
+        .collect();
+
+    for (id, addr) in candidates {
+        let socket: std::net::SocketAddr = match addr.parse() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%id, %addr, error = %e, "invalid peer addr, skipping lookup");
+                continue;
+            }
+        };
+        if let Some(server_id) = rt.block_on(crate::network::query_peer_for_token(socket, &token.0))
+        {
+            info!(%token, %server_id, "discovered session home server via peer probe");
+            return Some(server_id);
+        }
+    }
+    None
 }
 
 /// A peer's advertised load, used to choose a target for a new session.
@@ -668,4 +726,85 @@ fn ctrlc_handler(running: &Arc<AtomicBool>) {
         info!("received shutdown signal");
         r.store(false, Ordering::SeqCst);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerLoad, select_least_loaded_peer};
+
+    #[test]
+    fn no_candidates_is_none() {
+        assert_eq!(select_least_loaded_peer(&[]), None);
+    }
+
+    #[test]
+    fn picks_least_loaded() {
+        let peers = [
+            PeerLoad {
+                index: 0,
+                load_factor: 0.8,
+                weight: 1,
+            },
+            PeerLoad {
+                index: 1,
+                load_factor: 0.2,
+                weight: 1,
+            },
+            PeerLoad {
+                index: 2,
+                load_factor: 0.5,
+                weight: 1,
+            },
+        ];
+        assert_eq!(select_least_loaded_peer(&peers), Some(1));
+    }
+
+    #[test]
+    fn skips_peers_at_capacity() {
+        let peers = [
+            PeerLoad {
+                index: 0,
+                load_factor: 1.0,
+                weight: 1,
+            },
+            PeerLoad {
+                index: 1,
+                load_factor: 1.5,
+                weight: 1,
+            },
+        ];
+        // Every peer is at or over capacity → nobody is eligible.
+        assert_eq!(select_least_loaded_peer(&peers), None);
+    }
+
+    #[test]
+    fn weight_biases_toward_heavier_servers() {
+        // Both peers carry the same raw load, but peer 1 has twice the weight,
+        // so its weight-adjusted score is lower and it should be preferred.
+        let peers = [
+            PeerLoad {
+                index: 0,
+                load_factor: 0.6,
+                weight: 1,
+            },
+            PeerLoad {
+                index: 1,
+                load_factor: 0.6,
+                weight: 2,
+            },
+        ];
+        assert_eq!(select_least_loaded_peer(&peers), Some(1));
+    }
+
+    #[test]
+    fn zero_weight_does_not_divide_by_zero() {
+        // A weight of 0 is clamped to 1 internally; the call must not panic and
+        // should still pick the only below-capacity peer.
+        let peers = [PeerLoad {
+            index: 3,
+            load_factor: 0.4,
+            weight: 0,
+        }];
+        assert_eq!(select_least_loaded_peer(&peers), Some(3));
+    }
 }

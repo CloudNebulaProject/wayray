@@ -77,6 +77,16 @@ pub struct ServerInfoMsg {
     pub capacity: u32,
 }
 
+/// Response to a [`ControlMessage::SessionLookupRequest`]: whether the queried
+/// server currently hosts a resumable session for the given token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLookupResponse {
+    /// The responding server's id (so the asker can record the home server).
+    pub server_id: String,
+    /// `true` if this server hosts a resumable session for the queried token.
+    pub hosts: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ping {
     pub timestamp: u64,
@@ -105,6 +115,16 @@ pub enum ControlMessage {
     ServerInfoRequest,
     /// Response to a `ServerInfoRequest`.
     ServerInfo(ServerInfoMsg),
+    /// Cross-server affinity probe: a peer asks whether this server hosts a
+    /// resumable session for `token`. Used so a server that receives a client
+    /// for an unknown token can discover the session's home server and redirect
+    /// the client there instead of creating a duplicate.
+    SessionLookupRequest {
+        /// Session token to look up.
+        token: String,
+    },
+    /// Response to a `SessionLookupRequest`.
+    SessionLookupResponse(SessionLookupResponse),
     /// Sent in place of (or alongside) `ServerHello` when the client's session
     /// lives on a different server. The client reconnects to `addr`.
     SessionRedirect {

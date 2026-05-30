@@ -212,6 +212,17 @@ impl SessionRegistry {
         self.sessions.values()
     }
 
+    /// Tokens of sessions this server hosts in a resumable state (`Active` or
+    /// `Suspended`). Published to the network thread so peers can discover that
+    /// a token's session lives here via a `SessionLookupRequest` probe.
+    pub fn resumable_tokens(&self) -> Vec<String> {
+        self.sessions
+            .values()
+            .filter(|s| matches!(s.state, SessionState::Active | SessionState::Suspended))
+            .map(|s| s.token.0.clone())
+            .collect()
+    }
+
     /// Count sessions by state.
     pub fn count_by_state(&self, state: SessionState) -> usize {
         self.sessions.values().filter(|s| s.state == state).count()
@@ -387,6 +398,29 @@ mod tests {
         assert!((reg.load_factor() - 0.5).abs() < f32::EPSILON);
         assert_eq!(reg.capacity(), 4);
         assert_eq!(reg.local_server_id(), "server-a");
+    }
+
+    #[test]
+    fn resumable_tokens_lists_active_and_suspended() {
+        let mut reg = SessionRegistry::with_cluster("server-a", 50);
+        let active = reg.create_session(SessionToken::new("active-tok"));
+        let suspended = reg.create_session(SessionToken::new("suspended-tok"));
+        let creating = reg.create_session(SessionToken::new("creating-tok"));
+
+        reg.activate(active).unwrap();
+        reg.activate(suspended).unwrap();
+        reg.suspend(suspended).unwrap();
+        // `creating` stays in Creating; it is not yet resumable.
+        let _ = creating;
+
+        let mut tokens = reg.resumable_tokens();
+        tokens.sort();
+        assert_eq!(tokens, vec!["active-tok", "suspended-tok"]);
+
+        // A destroyed session drops out of the published set.
+        reg.destroy(active).unwrap();
+        let tokens = reg.resumable_tokens();
+        assert_eq!(tokens, vec!["suspended-tok".to_string()]);
     }
 
     #[test]

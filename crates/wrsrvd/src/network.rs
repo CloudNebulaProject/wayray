@@ -16,10 +16,11 @@
 //! protocol accounts for this by having each side write data before the other
 //! side tries to accept.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -29,8 +30,16 @@ use tracing::{error, info, warn};
 use wayray_protocol::codec;
 use wayray_protocol::messages::{
     ClientHello, ControlMessage, DisplayMessage, FrameUpdate, InputMessage, ServerHello,
-    ServerInfoMsg, SessionEvent,
+    ServerInfoMsg, SessionEvent, SessionLookupResponse,
 };
+
+/// Set of session tokens this server currently hosts in a resumable state.
+///
+/// Published by the compositor thread (which owns the session registry) and
+/// read by the network thread when answering `SessionLookupRequest` probes from
+/// peer servers. Shared so a peer can discover that a token's session lives here
+/// without round-tripping through the calloop event loop on the probe path.
+pub type LocalTokens = Arc<Mutex<HashSet<String>>>;
 
 /// Messages sent from the compositor to the network thread.
 pub enum CompositorToNet {
@@ -122,6 +131,10 @@ pub struct NetworkHandle {
     /// Live count of active sessions, published by the compositor and read by
     /// the network thread when answering `ServerInfo` queries from peers.
     pub active_sessions: Arc<AtomicU32>,
+    /// Tokens whose sessions are resumable on this server, published by the
+    /// compositor and read by the network thread when answering peer
+    /// `SessionLookupRequest` probes.
+    pub local_tokens: LocalTokens,
     /// Join handle for the background thread.
     join: Option<thread::JoinHandle<()>>,
 }
@@ -131,6 +144,16 @@ impl NetworkHandle {
     /// report an accurate load.
     pub fn set_active_sessions(&self, count: u32) {
         self.active_sessions.store(count, Ordering::Relaxed);
+    }
+
+    /// Replace the published set of resumable tokens hosted by this server.
+    /// Peers consult this (via `SessionLookupRequest`) to discover a token's
+    /// home server and redirect reconnecting clients here.
+    pub fn set_local_tokens(&self, tokens: impl IntoIterator<Item = String>) {
+        if let Ok(mut guard) = self.local_tokens.lock() {
+            guard.clear();
+            guard.extend(tokens);
+        }
     }
 
     /// Shut down the network thread and wait for it to exit.
@@ -187,13 +210,17 @@ pub fn start_server(config: ServerConfig) -> NetworkHandle {
 
     let active_sessions = Arc::new(AtomicU32::new(0));
     let active_for_thread = active_sessions.clone();
+    let local_tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
+    let tokens_for_thread = local_tokens.clone();
 
     let join = thread::Builder::new()
         .name("wayray-net".into())
         .spawn(move || {
             let rt = Runtime::new().expect("tokio runtime");
             rt.block_on(async move {
-                if let Err(e) = server_loop(config, net_rx, net_tx, active_for_thread).await {
+                if let Err(e) =
+                    server_loop(config, net_rx, net_tx, active_for_thread, tokens_for_thread).await
+                {
                     error!("network server error: {e}");
                 }
             });
@@ -204,6 +231,7 @@ pub fn start_server(config: ServerConfig) -> NetworkHandle {
         tx: comp_tx,
         rx: comp_rx,
         active_sessions,
+        local_tokens,
         join: Some(join),
     }
 }
@@ -214,6 +242,7 @@ async fn server_loop(
     compositor_rx: mpsc::Receiver<CompositorToNet>,
     compositor_tx: mpsc::Sender<NetToCompositor>,
     active_sessions: Arc<AtomicU32>,
+    local_tokens: LocalTokens,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server_config = build_server_config();
     let endpoint = quinn::Endpoint::server(server_config, config.bind_addr)?;
@@ -261,6 +290,7 @@ async fn server_loop(
             &compositor_rx,
             &compositor_tx,
             &active_sessions,
+            &local_tokens,
         )
         .await
         {
@@ -328,6 +358,7 @@ async fn handle_connection(
     compositor_rx: &mpsc::Receiver<CompositorToNet>,
     compositor_tx: &mpsc::Sender<NetToCompositor>,
     active_sessions: &Arc<AtomicU32>,
+    local_tokens: &LocalTokens,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Accept control stream. The peer writes its first control message
     // immediately after opening, so accept_bi resolves once that data arrives.
@@ -350,8 +381,24 @@ async fn handle_connection(
             info!("answered ServerInfo probe");
             return Ok(());
         }
+        ControlMessage::SessionLookupRequest { token } => {
+            let hosts = local_tokens
+                .lock()
+                .map(|t| t.contains(&token))
+                .unwrap_or(false);
+            let resp = ControlMessage::SessionLookupResponse(SessionLookupResponse {
+                server_id: config.server_id.clone(),
+                hosts,
+            });
+            write_message(&mut control_send, &resp).await?;
+            info!(%token, hosts, "answered SessionLookup probe");
+            return Ok(());
+        }
         other => {
-            return Err(format!("expected ClientHello or ServerInfoRequest, got {other:?}").into());
+            return Err(format!(
+                "expected ClientHello, ServerInfoRequest, or SessionLookupRequest, got {other:?}"
+            )
+            .into());
         }
     };
     info!(version = hello.version, "received ClientHello");
@@ -592,6 +639,45 @@ pub async fn query_peer_info(addr: SocketAddr) -> Option<ServerInfoMsg> {
         Ok(info) => info,
         Err(_) => {
             warn!(%addr, "peer ServerInfo query timed out");
+            None
+        }
+    }
+}
+
+/// Ask a peer server whether it hosts a resumable session for `token`, by
+/// opening a short-lived QUIC connection and exchanging
+/// `SessionLookupRequest`/`SessionLookupResponse` on the control stream.
+///
+/// Returns `Some(server_id)` when the peer confirms it hosts the session,
+/// `None` on a negative answer, error, or timeout. Used for cross-server
+/// session affinity: a server that receives a client for an unknown token
+/// probes its peers to find the session's home server before deciding whether
+/// to redirect the client there or create a new local session.
+pub async fn query_peer_for_token(addr: SocketAddr, token: &str) -> Option<String> {
+    let token = token.to_string();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().ok()?).ok()?;
+        endpoint.set_default_client_config(build_peer_client_config());
+
+        let connection = endpoint.connect(addr, "localhost").ok()?.await.ok()?;
+        let (mut send, mut recv) = connection.open_bi().await.ok()?;
+
+        write_message(&mut send, &ControlMessage::SessionLookupRequest { token })
+            .await
+            .ok()?;
+
+        let resp: ControlMessage = read_message(&mut recv).await.ok()?;
+        match resp {
+            ControlMessage::SessionLookupResponse(r) if r.hosts => Some(r.server_id),
+            _ => None,
+        }
+    })
+    .await;
+
+    match result {
+        Ok(server_id) => server_id,
+        Err(_) => {
+            warn!(%addr, "peer SessionLookup query timed out");
             None
         }
     }
@@ -918,11 +1004,19 @@ mod tests {
         // on this task via `join!` rather than `tokio::spawn`.
         let cfg = ServerConfig::default();
         let active = Arc::new(AtomicU32::new(0));
+        let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
         let server_fut = async {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx, &active)
-                .await;
+            let _ = handle_connection(
+                &connection,
+                &cfg,
+                &comp_to_net_rx,
+                &net_to_comp_tx,
+                &active,
+                &tokens,
+            )
+            .await;
             let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
             endpoint.close(0u32.into(), b"done");
         };
@@ -991,12 +1085,20 @@ mod tests {
             ..ServerConfig::default()
         };
         let active = Arc::new(AtomicU32::new(7));
+        let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
 
         let server_fut = async {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx, &active)
-                .await;
+            let _ = handle_connection(
+                &connection,
+                &cfg,
+                &comp_to_net_rx,
+                &net_to_comp_tx,
+                &active,
+                &tokens,
+            )
+            .await;
             // Keep the connection alive until the client has finished reading
             // the buffered ServerInfo, then let it close cleanly on drop.
             connection.closed().await;
@@ -1007,6 +1109,62 @@ mod tests {
             assert_eq!(info.server_id, "b");
             assert_eq!(info.active_sessions, 7);
             assert_eq!(info.capacity, 50);
+        };
+
+        tokio::join!(server_fut, client_fut);
+    }
+
+    /// A `SessionLookupRequest` over a loopback QUIC pair is answered from the
+    /// server's published token set. A peer probing for a token the server
+    /// hosts gets its server id back (cross-server affinity discovery); a token
+    /// it does not host yields `None`. Exercised end-to-end through
+    /// `query_peer_for_token`, the runtime data source that feeds
+    /// `note_remote_session`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn session_lookup_round_trips() {
+        let server_config = build_server_config();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let actual_addr = endpoint.local_addr().unwrap();
+
+        let (_comp_to_net_tx, comp_to_net_rx) = mpsc::channel::<CompositorToNet>();
+        let (net_to_comp_tx, _net_to_comp_rx) = mpsc::channel::<NetToCompositor>();
+
+        let cfg = ServerConfig {
+            server_id: "a".to_string(),
+            capacity: 50,
+            ..ServerConfig::default()
+        };
+        let active = Arc::new(AtomicU32::new(1));
+        // Server `a` hosts a resumable session for "token-T".
+        let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::from(["token-T".to_string()])));
+
+        // Two probes arrive on this connection-accepting server: one for a
+        // hosted token, one for an unknown token. Each probe is its own
+        // short-lived connection, so accept twice.
+        let server_fut = async {
+            for _ in 0..2 {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                let _ = handle_connection(
+                    &connection,
+                    &cfg,
+                    &comp_to_net_rx,
+                    &net_to_comp_tx,
+                    &active,
+                    &tokens,
+                )
+                .await;
+                connection.closed().await;
+            }
+        };
+
+        let client_fut = async {
+            let hit = query_peer_for_token(actual_addr, "token-T").await;
+            assert_eq!(hit.as_deref(), Some("a"));
+
+            let miss = query_peer_for_token(actual_addr, "nope").await;
+            assert_eq!(miss, None);
         };
 
         tokio::join!(server_fut, client_fut);
@@ -1043,11 +1201,19 @@ mod tests {
 
         let cfg = ServerConfig::default();
         let active = Arc::new(AtomicU32::new(0));
+        let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
         let server_fut = async {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx, &active)
-                .await;
+            let _ = handle_connection(
+                &connection,
+                &cfg,
+                &comp_to_net_rx,
+                &net_to_comp_tx,
+                &active,
+                &tokens,
+            )
+            .await;
             let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
             // Keep the connection alive until the client reads the buffered
             // SessionRedirect, then close on drop.
