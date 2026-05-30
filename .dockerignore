@@ -1,0 +1,11 @@
+# Keep the Docker build context small and reproducible. The container build
+# uses its own cache-mounted target dir, so the host target/ must never be
+# copied in.
+/target
+**/target
+.git
+.claude
+book/book
+vm
+*.md
+!Cargo.toml

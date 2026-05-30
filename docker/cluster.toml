@@ -1,0 +1,22 @@
+# Static multi-server cluster config (Phase 3.6).
+#
+# WayRay deliberately avoids mDNS/DNS-SD (unreliable inside illumos zones and on
+# segmented networks) in favour of a static TOML topology -- zero extra deps,
+# identical on illumos and Linux. This file makes wrsrvd start in clustered
+# mode so the multi-server code paths (session registry placement / redirect)
+# are exercised even in this single-node test deployment.
+local_id = "srv-a"
+
+[[servers]]
+id = "srv-a"
+addr = "wrsrvd:4433"
+weight = 1
+
+# A second, intentionally-unreachable peer so load-balancing / placement logic
+# has more than one candidate to reason about. New-session placement and
+# token-redirect queries against this peer will simply time out and fall back
+# to the local server, which is the expected graceful-degradation behaviour.
+[[servers]]
+id = "srv-b"
+addr = "wrsrvd-peer:4433"
+weight = 2

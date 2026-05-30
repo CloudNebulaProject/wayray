@@ -1,0 +1,92 @@
+# WayRay Phase 3 test deployment.
+#
+# Brings up the full remote-display loop:
+#   1. wrsrvd       -- headless Smithay compositor, QUIC on 4433/udp, clustered
+#                      mode (Phase 3.6) via cluster.toml.
+#   2. test-client  -- a real Wayland app (foot) connecting to wrsrvd's Wayland
+#                      socket through a shared XDG_RUNTIME_DIR volume, so there
+#                      is genuine content for the compositor to capture.
+#   3. wrclient     -- WayRay thin-client viewer connecting to wrsrvd over QUIC,
+#                      carrying a persistent session token to exercise the
+#                      Phase 3.5 hot-desking / session-rebind path.
+#
+# Bring up:   docker compose -f docker/docker-compose.yml up -d --build
+# Inspect:    docker compose -f docker/docker-compose.yml ps
+#             docker compose -f docker/docker-compose.yml logs wrsrvd
+
+name: wayray
+
+services:
+  wrsrvd:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: wrsrvd
+    image: wayray/wrsrvd:test
+    # Run the headless backend with the static cluster config so the
+    # multi-server placement / redirect code paths are active.
+    command: ["--cluster", "/etc/wayray/cluster.toml"]
+    environment:
+      RUST_LOG: "info,wrsrvd=debug"
+      XDG_RUNTIME_DIR: /run/wayray
+    volumes:
+      - wayland-runtime:/run/wayray
+      - ./cluster.toml:/etc/wayray/cluster.toml:ro
+    ports:
+      # QUIC is UDP. Published so a host-side wrclient can also connect.
+      - "4433:4433/udp"
+    healthcheck:
+      # The compositor is "up" once it has created its Wayland socket.
+      test: ["CMD-SHELL", "ls /run/wayray/wayland-* >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  test-client:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: wayland-test-client
+    image: wayray/test-client:test
+    environment:
+      XDG_RUNTIME_DIR: /run/wayray
+    volumes:
+      # Shares the Wayland socket created by wrsrvd.
+      - wayland-runtime:/run/wayray
+    depends_on:
+      wrsrvd:
+        condition: service_healthy
+    restart: unless-stopped
+
+  wrclient:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: wrclient
+    image: wayray/wrclient:test
+    # Connect to the compositor over QUIC, with a fixed session token so the
+    # server can rebind this token's session on reconnect (Phase 3.5).
+    command: ["wrsrvd:4433", "--token", "deadbeefcafebabe0011223344556677"]
+    environment:
+      RUST_LOG: "info,wrclient=debug"
+      WINIT_UNIX_BACKEND: wayland
+      # winit needs *a* Wayland display just to build its event loop. We point
+      # it at wrsrvd's own compositor socket via the shared runtime volume so
+      # the viewer can start, complete the QUIC handshake, and log the
+      # ServerHello session bind (Phase 3.5). It still cannot render without a
+      # GPU/display, which is fine for this headless evidence run.
+      XDG_RUNTIME_DIR: /run/wayray
+      WAYLAND_DISPLAY: wayland-1
+    volumes:
+      - wayland-runtime:/run/wayray
+    depends_on:
+      test-client:
+        condition: service_started
+      wrsrvd:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  wayland-runtime:
