@@ -27,11 +27,19 @@ use tracing::{info, warn};
 use wayray_protocol::encoding;
 use wayray_protocol::messages::FrameUpdate;
 
+use wayray_protocol::cluster::ClusterConfig;
+
 use crate::errors::WayRayError;
 use crate::handlers::ClientState;
-use crate::network::{CompositorToNet, NetToCompositor, NetworkHandle};
-use crate::session::{SessionRegistry, SessionState, SessionToken};
+use crate::network::{
+    CompositorToNet, ConnectDecision, NetToCompositor, NetworkHandle, SessionBinding,
+};
+use crate::session::{SessionLocation, SessionRegistry, SessionState, SessionToken};
 use crate::state::WayRay;
+
+/// Local load factor above which the server tries to shed *new* sessions to a
+/// less-loaded cluster peer. A guess pending deployment sizing.
+const LOAD_REDIRECT_THRESHOLD: f32 = 0.9;
 
 /// Dark grey clear color for the compositor background.
 const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
@@ -55,6 +63,11 @@ struct CalloopData {
     session_registry: SessionRegistry,
     /// The currently active session ID (if any).
     active_session: Option<crate::session::SessionId>,
+    /// Static cluster configuration for multi-server redirect / placement.
+    cluster: ClusterConfig,
+    /// Small tokio runtime used for short-lived peer `ServerInfo` queries
+    /// during new-session placement. `None` for single-server deployments.
+    peer_rt: Option<tokio::runtime::Runtime>,
 }
 
 /// Run the compositor with the headless PixmanRenderer backend.
@@ -66,6 +79,7 @@ pub fn run(
     mut state: WayRay,
     output: Output,
     net_handle: NetworkHandle,
+    cluster: ClusterConfig,
 ) -> Result<()> {
     // Create the PixmanRenderer (CPU software renderer).
     let mut renderer = PixmanRenderer::new().map_err(|e| {
@@ -144,6 +158,30 @@ pub fn run(
     let frame_size = frame_stride * output_size.h as usize;
     let previous_frame = vec![0u8; frame_size];
 
+    // Build the session registry knowing this server's cluster identity and
+    // capacity. The capacity comes from the local server entry's weight scaling
+    // (kept simple here: default capacity unless a local entry exists).
+    let local_id = cluster.local_id.clone();
+    let session_registry =
+        SessionRegistry::with_cluster(local_id.clone(), wayray_protocol::cluster::DEFAULT_CAPACITY);
+
+    // A dedicated tokio runtime for short-lived peer `ServerInfo` probes; only
+    // needed in a real cluster. Single-server deployments skip it entirely.
+    let peer_rt = if cluster.is_clustered() {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                warn!(error = %e, "failed to build peer-query runtime; load balancing disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut calloop_data = CalloopData {
         state,
         display,
@@ -154,8 +192,10 @@ pub fn run(
         previous_frame,
         frame_sequence: 0,
         client_connected: false,
-        session_registry: SessionRegistry::new(),
+        session_registry,
         active_session: None,
+        cluster,
+        peer_rt,
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -226,6 +266,24 @@ fn drain_network_events(data: &mut CalloopData) {
                 });
                 let token = SessionToken::new(token_str);
 
+                // Multi-server affinity: if this token's session is known to
+                // live on another server, redirect the client there instead of
+                // creating a duplicate local session.
+                if let SessionLocation::Remote(server_id) = data.session_registry.locate(&token) {
+                    if let Some(addr) = data.cluster.addr_of(&server_id) {
+                        info!(%token, %server_id, %addr, "redirecting client to home server");
+                        let _ = reply.send(ConnectDecision::Redirect {
+                            server_id,
+                            addr: addr.to_string(),
+                        });
+                        // Do not touch local session state; client reconnects
+                        // elsewhere.
+                        continue;
+                    } else {
+                        warn!(%server_id, "session marked remote but server addr unknown; serving locally");
+                    }
+                }
+
                 // Resolve the session: resume a suspended one, rebind ("steal")
                 // an active one whose old endpoint vanished, or create new.
                 let (session_id, resumed) = match data.session_registry.is_resumable(&token) {
@@ -254,6 +312,15 @@ fn drain_network_events(data: &mut CalloopData) {
                         (id, true)
                     }
                     None => {
+                        // NEW session: consider load-balancing to a peer before
+                        // creating it locally. Only attempts a redirect in a
+                        // real cluster when local load is over threshold.
+                        if let Some((server_id, addr)) = pick_peer_for_new_session(data) {
+                            info!(%token, %server_id, %addr, "load-balancing new session to peer");
+                            let _ = reply.send(ConnectDecision::Redirect { server_id, addr });
+                            continue;
+                        }
+
                         let id = data.session_registry.create_session(token.clone());
                         if let Err(e) = data.session_registry.activate(id) {
                             warn!(error = %e, "failed to activate new session");
@@ -265,14 +332,20 @@ fn drain_network_events(data: &mut CalloopData) {
                 data.active_session = Some(session_id);
                 data.client_connected = true;
 
+                // Publish the live active-session count so peer ServerInfo
+                // queries report an accurate load for balancing.
+                data.net_handle.set_active_sessions(
+                    data.session_registry.count_by_state(SessionState::Active) as u32,
+                );
+
                 // Reply to the network thread with the resolved binding so it
                 // can compose an accurate ServerHello.
                 if reply
-                    .send(crate::network::SessionBinding {
+                    .send(ConnectDecision::Bind(SessionBinding {
                         session_id: session_id.raw(),
                         resumed,
                         token: token.0.clone(),
-                    })
+                    }))
                     .is_err()
                 {
                     warn!("network thread dropped session binding reply channel");
@@ -297,6 +370,10 @@ fn drain_network_events(data: &mut CalloopData) {
                     }
                 }
                 data.client_connected = false;
+                // Refresh the published active count for peer load queries.
+                data.net_handle.set_active_sessions(
+                    data.session_registry.count_by_state(SessionState::Active) as u32,
+                );
             }
             Ok(NetToCompositor::Control(ctrl)) => {
                 tracing::debug!(?ctrl, "received control message");
@@ -308,6 +385,95 @@ fn drain_network_events(data: &mut CalloopData) {
                 break;
             }
         }
+    }
+}
+
+/// A peer's advertised load, used to choose a target for a new session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PeerLoad {
+    /// Index into the candidate list (so we can map back to id/addr).
+    index: usize,
+    /// active_sessions / capacity.
+    load_factor: f32,
+    /// Placement weight (higher = more preferred). Effective score divides the
+    /// load by the weight so heavier servers tolerate more sessions.
+    weight: u32,
+}
+
+/// Choose the best peer for a new session from advertised loads. Returns the
+/// index of the least-loaded (weight-adjusted) peer that is below 1.0, or
+/// `None` if every peer is at or above capacity.
+///
+/// Pure function so the placement policy is unit-testable without QUIC.
+fn select_least_loaded_peer(peers: &[PeerLoad]) -> Option<usize> {
+    peers
+        .iter()
+        .filter(|p| p.load_factor < 1.0)
+        .min_by(|a, b| {
+            let sa = a.load_factor / a.weight.max(1) as f32;
+            let sb = b.load_factor / b.weight.max(1) as f32;
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|p| p.index)
+}
+
+/// Decide whether a NEW session should be redirected to a cluster peer for
+/// load balancing. Returns `Some((server_id, addr))` to redirect, or `None` to
+/// create the session locally.
+///
+/// Only acts when (a) a real cluster is configured, (b) the local load factor
+/// exceeds [`LOAD_REDIRECT_THRESHOLD`], and (c) a peer advertises a lower load
+/// via a `ServerInfo` query. Single-server deployments always return `None`.
+fn pick_peer_for_new_session(data: &mut CalloopData) -> Option<(String, String)> {
+    if !data.cluster.is_clustered() {
+        return None;
+    }
+    if data.session_registry.load_factor() <= LOAD_REDIRECT_THRESHOLD {
+        return None;
+    }
+    let rt = data.peer_rt.as_ref()?;
+
+    // Snapshot peer (id, addr) candidates.
+    let candidates: Vec<(String, String)> = data
+        .cluster
+        .peers()
+        .map(|s| (s.id.clone(), s.addr.clone()))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Query each peer's load (short-lived QUIC probes). Skip peers that fail
+    // to resolve or do not answer in time.
+    let mut loads: Vec<PeerLoad> = Vec::new();
+    for (index, (id, addr)) in candidates.iter().enumerate() {
+        let socket: std::net::SocketAddr = match addr.parse() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%id, %addr, error = %e, "invalid peer addr, skipping");
+                continue;
+            }
+        };
+        let weight = data.cluster.server(id).map(|s| s.weight).unwrap_or(1);
+        if let Some(info) = rt.block_on(crate::network::query_peer_info(socket)) {
+            let cap = info.capacity.max(1) as f32;
+            loads.push(PeerLoad {
+                index,
+                load_factor: info.active_sessions as f32 / cap,
+                weight,
+            });
+        }
+    }
+
+    let local_load = data.session_registry.load_factor();
+    let best = select_least_loaded_peer(&loads)?;
+    let best_load = loads.iter().find(|p| p.index == best)?;
+    // Only redirect if the peer is actually less loaded than us.
+    if best_load.load_factor < local_load {
+        let (id, addr) = candidates[best].clone();
+        Some((id, addr))
+    } else {
+        None
     }
 }
 

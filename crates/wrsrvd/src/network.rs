@@ -17,6 +17,8 @@
 //! side tries to accept.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -27,7 +29,7 @@ use tracing::{error, info, warn};
 use wayray_protocol::codec;
 use wayray_protocol::messages::{
     ClientHello, ControlMessage, DisplayMessage, FrameUpdate, InputMessage, ServerHello,
-    SessionEvent,
+    ServerInfoMsg, SessionEvent,
 };
 
 /// Messages sent from the compositor to the network thread.
@@ -50,6 +52,21 @@ pub struct SessionBinding {
     pub token: String,
 }
 
+/// The compositor's decision for a connecting client: either bind the session
+/// locally (the common single-server path and hot-desk resume) or redirect the
+/// client to the server that actually hosts (or should host) its session.
+pub enum ConnectDecision {
+    /// Serve the session on this server.
+    Bind(SessionBinding),
+    /// Send the client to another server (session affinity or load balancing).
+    Redirect {
+        /// Target server id.
+        server_id: String,
+        /// Target server address as `host:port`.
+        addr: String,
+    },
+}
+
 /// Messages sent from the network thread to the compositor.
 pub enum NetToCompositor {
     /// An input event received from the client.
@@ -57,11 +74,12 @@ pub enum NetToCompositor {
     /// A control message (e.g., FrameAck) from the client.
     Control(ControlMessage),
     /// Client connected with the given hello. The compositor resolves the
-    /// session via the registry and replies with a `SessionBinding` so the
-    /// network thread can fill in the real session id / resumed flag.
+    /// session via the registry and replies with a `ConnectDecision` so the
+    /// network thread can either compose an accurate `ServerHello` or redirect
+    /// the client to the server that owns its session.
     ClientConnected {
         hello: ClientHello,
-        reply: mpsc::Sender<SessionBinding>,
+        reply: mpsc::Sender<ConnectDecision>,
     },
     /// Client disconnected.
     ClientDisconnected,
@@ -75,6 +93,12 @@ pub struct ServerConfig {
     pub output_width: u32,
     /// Virtual output dimensions for the ServerHello.
     pub output_height: u32,
+    /// This server's id within the cluster (empty for single-server mode).
+    /// Reported in `ServerInfo` responses so peers can identify it.
+    pub server_id: String,
+    /// Session capacity reported in `ServerInfo` responses (for load
+    /// balancing). Defaults to [`DEFAULT_CAPACITY`].
+    pub capacity: u32,
 }
 
 impl Default for ServerConfig {
@@ -83,6 +107,8 @@ impl Default for ServerConfig {
             bind_addr: "0.0.0.0:4433".parse().unwrap(),
             output_width: 1280,
             output_height: 720,
+            server_id: String::new(),
+            capacity: wayray_protocol::cluster::DEFAULT_CAPACITY,
         }
     }
 }
@@ -93,11 +119,20 @@ pub struct NetworkHandle {
     pub tx: mpsc::Sender<CompositorToNet>,
     /// Receive events from the network thread.
     pub rx: mpsc::Receiver<NetToCompositor>,
+    /// Live count of active sessions, published by the compositor and read by
+    /// the network thread when answering `ServerInfo` queries from peers.
+    pub active_sessions: Arc<AtomicU32>,
     /// Join handle for the background thread.
     join: Option<thread::JoinHandle<()>>,
 }
 
 impl NetworkHandle {
+    /// Publish the current active-session count so peer `ServerInfo` queries
+    /// report an accurate load.
+    pub fn set_active_sessions(&self, count: u32) {
+        self.active_sessions.store(count, Ordering::Relaxed);
+    }
+
     /// Shut down the network thread and wait for it to exit.
     pub fn shutdown(mut self) {
         let _ = self.tx.send(CompositorToNet::Shutdown);
@@ -150,12 +185,15 @@ pub fn start_server(config: ServerConfig) -> NetworkHandle {
     let (comp_tx, net_rx) = mpsc::channel::<CompositorToNet>();
     let (net_tx, comp_rx) = mpsc::channel::<NetToCompositor>();
 
+    let active_sessions = Arc::new(AtomicU32::new(0));
+    let active_for_thread = active_sessions.clone();
+
     let join = thread::Builder::new()
         .name("wayray-net".into())
         .spawn(move || {
             let rt = Runtime::new().expect("tokio runtime");
             rt.block_on(async move {
-                if let Err(e) = server_loop(config, net_rx, net_tx).await {
+                if let Err(e) = server_loop(config, net_rx, net_tx, active_for_thread).await {
                     error!("network server error: {e}");
                 }
             });
@@ -165,6 +203,7 @@ pub fn start_server(config: ServerConfig) -> NetworkHandle {
     NetworkHandle {
         tx: comp_tx,
         rx: comp_rx,
+        active_sessions,
         join: Some(join),
     }
 }
@@ -174,6 +213,7 @@ async fn server_loop(
     config: ServerConfig,
     compositor_rx: mpsc::Receiver<CompositorToNet>,
     compositor_tx: mpsc::Sender<NetToCompositor>,
+    active_sessions: Arc<AtomicU32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server_config = build_server_config();
     let endpoint = quinn::Endpoint::server(server_config, config.bind_addr)?;
@@ -215,8 +255,14 @@ async fn server_loop(
             "client connected"
         );
 
-        if let Err(e) =
-            handle_connection(&connection, &config, &compositor_rx, &compositor_tx).await
+        if let Err(e) = handle_connection(
+            &connection,
+            &config,
+            &compositor_rx,
+            &compositor_tx,
+            &active_sessions,
+        )
+        .await
         {
             warn!("client session ended: {e}");
         }
@@ -229,13 +275,13 @@ async fn server_loop(
     Ok(())
 }
 
-/// Await a `SessionBinding` reply from the compositor, polling the blocking
+/// Await a `ConnectDecision` reply from the compositor, polling the blocking
 /// `std::sync::mpsc` channel from this async context with a short interval and
 /// a hard deadline. Returns `None` on timeout or if the sender is dropped.
 async fn recv_binding_with_timeout(
-    rx: mpsc::Receiver<SessionBinding>,
+    rx: mpsc::Receiver<ConnectDecision>,
     timeout: std::time::Duration,
-) -> Option<SessionBinding> {
+) -> Option<ConnectDecision> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match rx.try_recv() {
@@ -281,34 +327,51 @@ async fn handle_connection(
     config: &ServerConfig,
     compositor_rx: &mpsc::Receiver<CompositorToNet>,
     compositor_tx: &mpsc::Sender<NetToCompositor>,
+    active_sessions: &Arc<AtomicU32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Accept control stream. The client writes ClientHello immediately
-    // after opening, so accept_bi resolves once that data arrives.
+    // Step 1: Accept control stream. The peer writes its first control message
+    // immediately after opening, so accept_bi resolves once that data arrives.
     let (mut control_send, mut control_recv) = connection.accept_bi().await?;
     info!("control stream established");
 
-    // Step 2: Read ClientHello, send ServerHello.
-    let client_hello: ControlMessage = read_message(&mut control_recv).await?;
-    let ControlMessage::ClientHello(hello) = client_hello else {
-        return Err(format!("expected ClientHello, got {client_hello:?}").into());
+    // Step 2: Read the first control message. A peer load-balancing probe sends
+    // `ServerInfoRequest` and expects a `ServerInfo` reply; a real client sends
+    // `ClientHello`.
+    let first: ControlMessage = read_message(&mut control_recv).await?;
+    let hello = match first {
+        ControlMessage::ClientHello(hello) => hello,
+        ControlMessage::ServerInfoRequest => {
+            let info = ControlMessage::ServerInfo(ServerInfoMsg {
+                server_id: config.server_id.clone(),
+                active_sessions: active_sessions.load(Ordering::Relaxed),
+                capacity: config.capacity,
+            });
+            write_message(&mut control_send, &info).await?;
+            info!("answered ServerInfo probe");
+            return Ok(());
+        }
+        other => {
+            return Err(format!("expected ClientHello or ServerInfoRequest, got {other:?}").into());
+        }
     };
     info!(version = hello.version, "received ClientHello");
     let fallback_token = hello.token.clone().unwrap_or_default();
 
     // Round-trip to the compositor: it resolves the session via the registry
-    // and replies with the real session id / resumed flag. We bound the wait
-    // so a stalled compositor cannot wedge the handshake; on timeout we fall
-    // back to a best-effort ServerHello.
-    let (reply_tx, reply_rx) = mpsc::channel::<SessionBinding>();
+    // and replies with either a binding (serve here) or a redirect (the session
+    // lives on another server / load balancing). We bound the wait so a stalled
+    // compositor cannot wedge the handshake; on timeout we fall back to a
+    // best-effort local ServerHello.
+    let (reply_tx, reply_rx) = mpsc::channel::<ConnectDecision>();
     let connect_start = std::time::Instant::now();
     let _ = compositor_tx.send(NetToCompositor::ClientConnected {
         hello,
         reply: reply_tx,
     });
 
-    let binding = recv_binding_with_timeout(reply_rx, std::time::Duration::from_millis(250)).await;
-    let (session_id, resumed, token) = match binding {
-        Some(b) => {
+    let decision = recv_binding_with_timeout(reply_rx, std::time::Duration::from_millis(250)).await;
+    let (session_id, resumed, token) = match decision {
+        Some(ConnectDecision::Bind(b)) => {
             info!(
                 session_id = b.session_id,
                 resumed = b.resumed,
@@ -316,6 +379,15 @@ async fn handle_connection(
                 "session binding resolved"
             );
             (b.session_id, b.resumed, b.token)
+        }
+        Some(ConnectDecision::Redirect { server_id, addr }) => {
+            // The session belongs elsewhere (affinity) or this server is
+            // shedding load. Tell the client where to go and close cleanly.
+            info!(%server_id, %addr, "redirecting client to peer server");
+            let redirect = ControlMessage::SessionRedirect { server_id, addr };
+            write_message(&mut control_send, &redirect).await?;
+            let _ = control_send.finish();
+            return Ok(());
         }
         None => {
             warn!("timed out waiting for session binding; using fallback ServerHello");
@@ -431,6 +503,96 @@ async fn check_compositor_commands(
                 // Yield to let other select branches run.
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
+        }
+    }
+}
+
+/// Build a quinn client config that skips server certificate verification.
+/// Used for short-lived peer `ServerInfo` probes (dev self-signed certs).
+fn build_peer_client_config() -> quinn::ClientConfig {
+    let provider = rustls::crypto::ring::default_provider();
+    let crypto = rustls::ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .expect("TLS protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PeerSkipVerification))
+        .with_no_client_auth();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .expect("QUIC client crypto config");
+    quinn::ClientConfig::new(std::sync::Arc::new(crypto))
+}
+
+/// Certificate verifier for peer probes that accepts any server cert (dev).
+#[derive(Debug)]
+struct PeerSkipVerification;
+
+impl rustls::client::danger::ServerCertVerifier for PeerSkipVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Query a peer server's load by opening a short-lived QUIC connection and
+/// exchanging `ServerInfoRequest`/`ServerInfo` on the control stream.
+///
+/// Returns `None` on any error or timeout; callers treat that as "peer
+/// unavailable" and fall back to local placement.
+pub async fn query_peer_info(addr: SocketAddr) -> Option<ServerInfoMsg> {
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().ok()?).ok()?;
+        endpoint.set_default_client_config(build_peer_client_config());
+
+        let connection = endpoint.connect(addr, "localhost").ok()?.await.ok()?;
+        let (mut send, mut recv) = connection.open_bi().await.ok()?;
+
+        write_message(&mut send, &ControlMessage::ServerInfoRequest)
+            .await
+            .ok()?;
+
+        let resp: ControlMessage = read_message(&mut recv).await.ok()?;
+        match resp {
+            ControlMessage::ServerInfo(info) => Some(info),
+            _ => None,
+        }
+    })
+    .await;
+
+    match result {
+        Ok(info) => info,
+        Err(_) => {
+            warn!(%addr, "peer ServerInfo query timed out");
+            None
         }
     }
 }
@@ -691,25 +853,30 @@ mod tests {
     #[tokio::test]
     async fn binding_timeout_returns_none() {
         // No sender ever sends; should time out quickly and return None.
-        let (_tx, rx) = mpsc::channel::<SessionBinding>();
+        let (_tx, rx) = mpsc::channel::<ConnectDecision>();
         let binding = recv_binding_with_timeout(rx, std::time::Duration::from_millis(20)).await;
         assert!(binding.is_none());
     }
 
     #[tokio::test]
     async fn binding_received_before_timeout() {
-        let (tx, rx) = mpsc::channel::<SessionBinding>();
-        tx.send(SessionBinding {
+        let (tx, rx) = mpsc::channel::<ConnectDecision>();
+        tx.send(ConnectDecision::Bind(SessionBinding {
             session_id: 7,
             resumed: true,
             token: "t".into(),
-        })
+        }))
         .unwrap();
-        let binding = recv_binding_with_timeout(rx, std::time::Duration::from_millis(250))
+        let decision = recv_binding_with_timeout(rx, std::time::Duration::from_millis(250))
             .await
-            .expect("binding should arrive");
-        assert_eq!(binding.session_id, 7);
-        assert!(binding.resumed);
+            .expect("decision should arrive");
+        match decision {
+            ConnectDecision::Bind(b) => {
+                assert_eq!(b.session_id, 7);
+                assert!(b.resumed);
+            }
+            ConnectDecision::Redirect { .. } => panic!("expected Bind"),
+        }
     }
 
     /// Full handshake through `handle_connection`, with a fake compositor that
@@ -733,11 +900,11 @@ mod tests {
                     Ok(NetToCompositor::ClientConnected { hello, reply }) => {
                         assert_eq!(hello.token.as_deref(), Some("session-token"));
                         reply
-                            .send(SessionBinding {
+                            .send(ConnectDecision::Bind(SessionBinding {
                                 session_id: 314,
                                 resumed: true,
                                 token: "session-token".into(),
-                            })
+                            }))
                             .unwrap();
                     }
                     Ok(NetToCompositor::ClientDisconnected) | Err(_) => break,
@@ -750,10 +917,12 @@ mod tests {
         // The compositor channels are not `Send`, so we drive the server side
         // on this task via `join!` rather than `tokio::spawn`.
         let cfg = ServerConfig::default();
+        let active = Arc::new(AtomicU32::new(0));
         let server_fut = async {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx).await;
+            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx, &active)
+                .await;
             let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
             endpoint.close(0u32.into(), b"done");
         };
@@ -793,6 +962,124 @@ mod tests {
             ));
 
             // Tear down: drop client so handle_connection's relay loop ends.
+            drop(control_send);
+            drop(control_recv);
+            drop(connection);
+            let _ = comp_to_net_tx.send(CompositorToNet::Shutdown);
+        };
+
+        tokio::join!(server_fut, client_fut);
+        let _ = fake_compositor.join();
+    }
+
+    /// A `ServerInfoRequest` over a loopback QUIC pair gets a `ServerInfo`
+    /// reply carrying the configured server id, active session count, and
+    /// capacity. Exercised end-to-end through `query_peer_info`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn server_info_round_trips() {
+        let server_config = build_server_config();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let actual_addr = endpoint.local_addr().unwrap();
+
+        let (_comp_to_net_tx, comp_to_net_rx) = mpsc::channel::<CompositorToNet>();
+        let (net_to_comp_tx, _net_to_comp_rx) = mpsc::channel::<NetToCompositor>();
+
+        let cfg = ServerConfig {
+            server_id: "b".to_string(),
+            capacity: 50,
+            ..ServerConfig::default()
+        };
+        let active = Arc::new(AtomicU32::new(7));
+
+        let server_fut = async {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx, &active)
+                .await;
+            // Keep the connection alive until the client has finished reading
+            // the buffered ServerInfo, then let it close cleanly on drop.
+            connection.closed().await;
+        };
+
+        let client_fut = async {
+            let info = query_peer_info(actual_addr).await.expect("ServerInfo");
+            assert_eq!(info.server_id, "b");
+            assert_eq!(info.active_sessions, 7);
+            assert_eq!(info.capacity, 50);
+        };
+
+        tokio::join!(server_fut, client_fut);
+    }
+
+    /// When the compositor replies with `ConnectDecision::Redirect`, the client
+    /// receives a `SessionRedirect` carrying the expected target id and addr.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn redirect_decision_sends_session_redirect() {
+        let server_config = build_server_config();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let actual_addr = endpoint.local_addr().unwrap();
+
+        let (comp_to_net_tx, comp_to_net_rx) = mpsc::channel::<CompositorToNet>();
+        let (net_to_comp_tx, net_to_comp_rx) = mpsc::channel::<NetToCompositor>();
+
+        let fake_compositor = std::thread::spawn(move || {
+            loop {
+                match net_to_comp_rx.recv() {
+                    Ok(NetToCompositor::ClientConnected { reply, .. }) => {
+                        reply
+                            .send(ConnectDecision::Redirect {
+                                server_id: "a".to_string(),
+                                addr: "10.0.0.1:4433".to_string(),
+                            })
+                            .unwrap();
+                    }
+                    Ok(NetToCompositor::ClientDisconnected) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let cfg = ServerConfig::default();
+        let active = Arc::new(AtomicU32::new(0));
+        let server_fut = async {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx, &active)
+                .await;
+            let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
+            // Keep the connection alive until the client reads the buffered
+            // SessionRedirect, then close on drop.
+            connection.closed().await;
+        };
+
+        let client_fut = async {
+            let client_endpoint = build_test_client_endpoint();
+            let connection = client_endpoint
+                .connect(actual_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut control_send, mut control_recv) = connection.open_bi().await.unwrap();
+            let client_hello = ControlMessage::ClientHello(ClientHello {
+                version: wayray_protocol::PROTOCOL_VERSION,
+                capabilities: vec![],
+                token: Some("remote-token".to_string()),
+            });
+            write_message(&mut control_send, &client_hello)
+                .await
+                .unwrap();
+
+            let response: ControlMessage = read_message(&mut control_recv).await.unwrap();
+            match response {
+                ControlMessage::SessionRedirect { server_id, addr } => {
+                    assert_eq!(server_id, "a");
+                    assert_eq!(addr, "10.0.0.1:4433");
+                }
+                other => panic!("expected SessionRedirect, got {other:?}"),
+            }
+
             drop(control_send);
             drop(control_recv);
             drop(connection);

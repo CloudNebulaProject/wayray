@@ -4,6 +4,7 @@
 //! Messages are serialized with postcard and framed with a 4-byte
 //! length prefix for transmission over QUIC streams.
 
+pub mod cluster;
 pub mod codec;
 pub mod encoding;
 pub mod launcher;

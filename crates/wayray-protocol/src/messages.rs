@@ -54,6 +54,27 @@ pub enum SessionEvent {
     /// Session was resumed on reconnect (hot-desking). The client should
     /// clear any frame cache and expect a full redraw.
     Resumed { session_id: u64 },
+    /// Session lives on (or has been moved to) another server. The client
+    /// should reconnect to the indicated server with the same token.
+    Redirected {
+        /// Target server id (matches the cluster config).
+        server_id: String,
+        /// Target server address as `host:port`.
+        addr: String,
+    },
+}
+
+/// Lightweight server-info query/response used for cross-server load
+/// balancing. A new variant on the control channel; appended to keep
+/// postcard back-compat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerInfoMsg {
+    /// The responding server's id.
+    pub server_id: String,
+    /// Number of currently active sessions on the server.
+    pub active_sessions: u32,
+    /// Maximum number of sessions the server is willing to host.
+    pub capacity: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,6 +100,19 @@ pub enum ControlMessage {
     Pong(Pong),
     FrameAck(FrameAck),
     SessionEvent(SessionEvent),
+    /// Lightweight server-info request (empty payload) used by a peer/client
+    /// to probe load before placing a new session.
+    ServerInfoRequest,
+    /// Response to a `ServerInfoRequest`.
+    ServerInfo(ServerInfoMsg),
+    /// Sent in place of (or alongside) `ServerHello` when the client's session
+    /// lives on a different server. The client reconnects to `addr`.
+    SessionRedirect {
+        /// Target server id (matches the cluster config).
+        server_id: String,
+        /// Target server address as `host:port`.
+        addr: String,
+    },
 }
 
 // ── Display channel (server → client, unidirectional) ───────────────

@@ -15,6 +15,7 @@ use smithay::{
     utils::Transform,
 };
 use tracing::info;
+use wayray_protocol::cluster::ClusterConfig;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -31,6 +32,36 @@ fn main() -> Result<()> {
     let use_winit = args
         .windows(2)
         .any(|w| w[0] == "--backend" && w[1] == "winit");
+
+    // Load multi-server cluster configuration. `--cluster <path>` overrides the
+    // default search locations; absent config means single-server mode.
+    let cluster = match args.windows(2).find(|w| w[0] == "--cluster") {
+        Some(w) => {
+            let path = std::path::PathBuf::from(&w[1]);
+            match ClusterConfig::load(&path) {
+                Ok(c) => {
+                    info!(path = %path.display(), servers = c.servers.len(), "loaded cluster config");
+                    c
+                }
+                Err(e) => {
+                    return Err(errors::WayRayError::BackendInit(Box::<
+                        dyn std::error::Error + Send + Sync,
+                    >::from(
+                        e.to_string()
+                    ))
+                    .into());
+                }
+            }
+        }
+        None => ClusterConfig::load_default(),
+    };
+    if cluster.is_clustered() {
+        info!(
+            local_id = %cluster.local_id,
+            peers = cluster.peers().count(),
+            "running in multi-server cluster mode"
+        );
+    }
 
     // Create the Wayland display.
     let mut display =
@@ -67,6 +98,8 @@ fn main() -> Result<()> {
     let net_handle = start_server(ServerConfig {
         output_width: output_size.w as u32,
         output_height: output_size.h as u32,
+        server_id: cluster.local_id.clone(),
+        capacity: wayray_protocol::cluster::DEFAULT_CAPACITY,
         ..ServerConfig::default()
     });
     info!("QUIC network server started");
@@ -90,5 +123,5 @@ fn main() -> Result<()> {
         }
     }
 
-    backend::headless::run(display, state, output, net_handle)
+    backend::headless::run(display, state, output, net_handle, cluster)
 }

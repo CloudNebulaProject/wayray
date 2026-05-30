@@ -8,6 +8,7 @@ pub mod display;
 pub mod input;
 pub mod network;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -282,6 +283,134 @@ async fn run_session_loop(
     }
 }
 
+/// Maximum number of redirect hops before giving up (loop guard).
+const MAX_REDIRECTS: u32 = 3;
+
+/// Outcome of one (redirect-following) connection attempt.
+enum ConnectResult {
+    /// Connected to a server; streams ready. Boxed to keep the enum small.
+    Connected(Box<(quinn::Endpoint, network::ServerConnection)>),
+    /// Connection failed on the very first attempt — the client should give up.
+    FatalFirstAttempt,
+    /// Connection failed; the caller should back off and retry.
+    Retry,
+}
+
+/// Connect to one of the candidate servers (tried in order), following up to
+/// [`MAX_REDIRECTS`] `SessionRedirect` responses (multi-server affinity / load
+/// balancing). The same token is reused on every hop and every candidate so
+/// the home server resumes the session.
+async fn connect_following_redirects(
+    candidates: &[(SocketAddr, String)],
+    token: &Option<String>,
+    first_attempt: bool,
+) -> ConnectResult {
+    let mut last_error: Option<String> = None;
+
+    for (cand_idx, (cand_addr, cand_name)) in candidates.iter().enumerate() {
+        // Each candidate gets its own redirect chain.
+        let mut server_addr = *cand_addr;
+        let mut server_name = cand_name.clone();
+
+        for hop in 0..=MAX_REDIRECTS {
+            let config = ClientConfig {
+                server_addr,
+                server_name: server_name.clone(),
+                capabilities: vec!["display".to_string()],
+                token: token.clone(),
+            };
+
+            match network::connect(&config).await {
+                Ok(network::ConnectOutcome::Connected(ep, conn)) => {
+                    return ConnectResult::Connected(Box::new((ep, conn)));
+                }
+                Ok(network::ConnectOutcome::Redirect { server_id, addr }) => {
+                    if hop == MAX_REDIRECTS {
+                        warn!(%server_id, %addr, "redirect limit reached for candidate");
+                        break; // try the next candidate
+                    }
+                    match network::resolve_server_addr(&addr) {
+                        Ok((resolved, name)) => {
+                            info!(%server_id, target = %resolved, hop, "following redirect");
+                            server_addr = resolved;
+                            server_name = name;
+                        }
+                        Err(e) => {
+                            warn!(%server_id, %addr, error = %e, "cannot resolve redirect target");
+                            break; // try the next candidate
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    warn!(candidate = cand_idx, error = %e, "connection attempt failed");
+                    break; // try the next candidate
+                }
+            }
+        }
+    }
+
+    if first_attempt {
+        error!(error = ?last_error, "failed to connect to any candidate server");
+        return ConnectResult::FatalFirstAttempt;
+    }
+    ConnectResult::Retry
+}
+
+/// Parse the server candidate list from CLI args: positional `host:port`
+/// entries plus every server listed in a `--cluster <path>` cluster.toml.
+/// Each entry is resolved to a `(SocketAddr, server_name)` pair; unresolvable
+/// entries are skipped with a warning.
+fn parse_server_candidates(args: &[String]) -> Vec<(SocketAddr, String)> {
+    let mut candidates = Vec::new();
+
+    // Positional args (everything that is not a flag or a flag value).
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--token" || a == "--cluster" {
+            i += 2; // skip the flag and its value
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        match network::resolve_server_addr(a) {
+            Ok((addr, name)) => candidates.push((addr, name)),
+            Err(e) => warn!(arg = %a, error = %e, "skipping unresolvable server address"),
+        }
+        i += 1;
+    }
+
+    // --cluster <path>: add every server entry from the cluster config.
+    if let Some(pos) = args.iter().position(|a| a == "--cluster")
+        && let Some(path) = args.get(pos + 1)
+    {
+        match wayray_protocol::cluster::ClusterConfig::load(std::path::Path::new(path)) {
+            Ok(cluster) => {
+                for server in &cluster.servers {
+                    match network::resolve_server_addr(&server.addr) {
+                        Ok((addr, name)) => {
+                            if !candidates.iter().any(|(a, _)| *a == addr) {
+                                candidates.push((addr, name));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(server = %server.id, addr = %server.addr, error = %e, "skipping cluster entry")
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to load cluster config '{path}': {e}");
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Load or generate a persistent session token.
 ///
 /// Reads from `~/.config/wayray/token`. If the file doesn't exist,
@@ -335,27 +464,30 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse: wrclient <host>:<port> [--token <token>]
-    let addr_arg = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("Usage: wrclient <host>:<port> [--token <token>]");
-        std::process::exit(1);
-    });
-
+    // Parse: wrclient [<host>:<port> ...] [--token <token>] [--cluster <path>]
+    //
+    // Candidate servers are tried in order until one binds (or redirects to a
+    // working server). Sources, in priority order: positional host:port args,
+    // then every server in a --cluster <path> cluster.toml.
     let token = if let Some(pos) = args.iter().position(|a| a == "--token") {
         args.get(pos + 1).cloned()
     } else {
         Some(load_or_generate_token())
     };
 
-    let (server_addr, server_name) = match network::resolve_server_addr(&addr_arg) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("Invalid server address '{}': {}", addr_arg, e);
-            std::process::exit(1);
-        }
-    };
+    let candidates = parse_server_candidates(&args);
+    if candidates.is_empty() {
+        eprintln!(
+            "Usage: wrclient <host>:<port> [<host>:<port> ...] [--token <token>] [--cluster <path>]"
+        );
+        std::process::exit(1);
+    }
 
-    info!(server = %server_addr, name = %server_name, token = ?token, "connecting to server");
+    info!(
+        candidates = candidates.len(),
+        token = ?token,
+        "connecting to server (trying candidates in order)"
+    );
 
     let (frame_tx, frame_rx) = mpsc::channel::<FrameData>();
     let (input_tx, input_rx) = mpsc::channel::<InputMessage>();
@@ -382,13 +514,6 @@ fn main() {
                 .expect("failed to create tokio runtime");
 
             rt.block_on(async move {
-                let config = ClientConfig {
-                    server_addr,
-                    server_name,
-                    capabilities: vec!["display".to_string()],
-                    token,
-                };
-
                 // Reconnect loop: on any disconnection we immediately retry with
                 // the SAME token so the server resumes the existing session
                 // (hot-desking). Backoff starts tight to hit the <500ms target.
@@ -399,25 +524,33 @@ fn main() {
                 loop {
                     // Time from the start of a reconnect attempt to ServerHello.
                     let attempt_start = std::time::Instant::now();
-                    let connect_result = network::connect(&config).await;
 
-                    let (_endpoint, mut conn) = match connect_result {
-                        Ok(c) => c,
-                        Err(e) => {
-                            if first_attempt {
-                                error!(error = %e, "failed to connect to server");
+                    // Connect, trying candidates in order and following redirects
+                    // (capped) to the server that owns our session or a
+                    // less-loaded peer.
+                    let (_endpoint, mut conn) =
+                        match connect_following_redirects(&candidates, &token, first_attempt).await
+                        {
+                            ConnectResult::Connected(boxed) => {
+                                let (ep, conn) = *boxed;
+                                (ep, conn)
+                            }
+                            ConnectResult::FatalFirstAttempt => {
                                 // Unblock the main thread on the very first try.
                                 let _ = dim_tx.send((0, 0));
                                 return;
                             }
-                            warn!(error = %e, backoff_ms = backoff.as_millis() as u64,
-                                "reconnect failed, retrying");
-                            tokio::time::sleep(backoff).await;
-                            backoff =
-                                (backoff * 2).min(std::time::Duration::from_millis(MAX_BACKOFF_MS));
-                            continue;
-                        }
-                    };
+                            ConnectResult::Retry => {
+                                warn!(
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    "reconnect failed, retrying"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2)
+                                    .min(std::time::Duration::from_millis(MAX_BACKOFF_MS));
+                                continue;
+                            }
+                        };
 
                     first_attempt = false;
                     // Successful connection resets the backoff.

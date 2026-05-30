@@ -71,6 +71,21 @@ impl Default for ClientConfig {
     }
 }
 
+/// Outcome of a connection attempt: either an established session or a
+/// redirect to another server (multi-server affinity / load balancing).
+pub enum ConnectOutcome {
+    /// The server accepted the session; streams are ready.
+    Connected(quinn::Endpoint, ServerConnection),
+    /// The server redirected us to another address. The client should
+    /// reconnect there with the same token.
+    Redirect {
+        /// Target server id (for logging).
+        server_id: String,
+        /// Target server address as `host:port`.
+        addr: String,
+    },
+}
+
 /// An established connection to a wrsrvd server with all streams ready.
 ///
 /// After `connect()`, the control stream and input stream are ready to use.
@@ -195,9 +210,7 @@ fn build_client_config() -> quinn::ClientConfig {
 ///
 /// The caller must keep the returned `quinn::Endpoint` alive for the
 /// duration of the connection.
-pub async fn connect(
-    config: &ClientConfig,
-) -> Result<(quinn::Endpoint, ServerConnection), Box<dyn std::error::Error>> {
+pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn std::error::Error>> {
     let client_config = build_client_config();
 
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
@@ -222,7 +235,8 @@ pub async fn connect(
     write_message(&mut control_send, &client_hello).await?;
     info!("sent ClientHello");
 
-    // Read ServerHello response.
+    // Read the server's response: ServerHello (accepted) or SessionRedirect
+    // (our session lives elsewhere / load balancing).
     let response: ControlMessage = read_message(&mut control_recv).await?;
     let server_hello = match response {
         ControlMessage::ServerHello(hello) => {
@@ -237,6 +251,10 @@ pub async fn connect(
             );
             hello
         }
+        ControlMessage::SessionRedirect { server_id, addr } => {
+            info!(%server_id, %addr, "server redirected us to a peer");
+            return Ok(ConnectOutcome::Redirect { server_id, addr });
+        }
         other => {
             return Err(format!("expected ServerHello, got {other:?}").into());
         }
@@ -247,7 +265,7 @@ pub async fn connect(
     let input_send = connection.open_uni().await?;
     info!("input stream opened");
 
-    Ok((
+    Ok(ConnectOutcome::Connected(
         endpoint,
         ServerConnection {
             connection,
@@ -364,7 +382,10 @@ mod tests {
             token: Some("test-token".to_string()),
         };
 
-        let (_endpoint, mut conn) = connect(&config).await.unwrap();
+        let (_endpoint, mut conn) = match connect(&config).await.unwrap() {
+            ConnectOutcome::Connected(ep, conn) => (ep, conn),
+            ConnectOutcome::Redirect { .. } => panic!("unexpected redirect"),
+        };
         assert_eq!(conn.server_hello.session_id, 99);
         assert_eq!(conn.server_hello.output_width, 1920);
 
@@ -420,7 +441,10 @@ mod tests {
             token: None,
         };
 
-        let (_endpoint, mut conn) = connect(&config).await.unwrap();
+        let (_endpoint, mut conn) = match connect(&config).await.unwrap() {
+            ConnectOutcome::Connected(ep, conn) => (ep, conn),
+            ConnectOutcome::Redirect { .. } => panic!("unexpected redirect"),
+        };
 
         // Send input (triggers server's accept_uni for input stream).
         let input = InputMessage::Keyboard(KeyboardEvent {
@@ -435,6 +459,46 @@ mod tests {
         let frame = read_display_message(&mut display_recv).await.unwrap();
         let DisplayMessage::FrameUpdate(update) = frame;
         assert_eq!(update.sequence, 7);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_handles_session_redirect() {
+        let (endpoint, addr) = start_test_server().await;
+
+        // Server side: read ClientHello, reply with a SessionRedirect.
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let (mut control_send, mut control_recv) = connection.accept_bi().await.unwrap();
+            let _: ControlMessage = read_message(&mut control_recv).await.unwrap();
+
+            let redirect = ControlMessage::SessionRedirect {
+                server_id: "a".to_string(),
+                addr: "10.0.0.1:4433".to_string(),
+            };
+            write_message(&mut control_send, &redirect).await.unwrap();
+            let _ = control_send.finish();
+            // Give the client a moment to read before closing.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            endpoint.close(0u32.into(), b"done");
+        });
+
+        let config = ClientConfig {
+            server_addr: addr,
+            server_name: "localhost".to_string(),
+            capabilities: vec![],
+            token: Some("remote-token".to_string()),
+        };
+
+        match connect(&config).await.unwrap() {
+            ConnectOutcome::Redirect { server_id, addr } => {
+                assert_eq!(server_id, "a");
+                assert_eq!(addr, "10.0.0.1:4433");
+            }
+            ConnectOutcome::Connected(..) => panic!("expected redirect"),
+        }
 
         server.await.unwrap();
     }

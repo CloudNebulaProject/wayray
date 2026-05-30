@@ -3,16 +3,39 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 use super::types::{Session, SessionId, SessionState, SessionToken, SessionTransitionError};
+use wayray_protocol::cluster::DEFAULT_CAPACITY;
+
+/// Where a session bound to a token currently lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLocation {
+    /// The session lives on this server.
+    Local(SessionId),
+    /// The session lives on another server (by id).
+    Remote(String),
+    /// No session is known for the token anywhere.
+    Unknown,
+}
 
 /// In-memory session registry.
 ///
 /// Provides O(1) lookup by both session ID and token. Tracks all sessions
 /// including suspended ones (until they time out and are cleaned up).
+///
+/// For multi-server deployments the registry also knows the local server's id
+/// (stamped onto every session it creates) and a best-effort map of tokens
+/// whose sessions are known to live on other servers, populated from cluster
+/// configuration or peer queries.
 pub struct SessionRegistry {
     sessions: HashMap<SessionId, Session>,
     /// Reverse index: token → session ID for fast lookup on client connect.
     token_index: HashMap<SessionToken, SessionId>,
     next_id: u64,
+    /// This server's id within the cluster (empty for single-server mode).
+    local_server_id: String,
+    /// Tokens known to live on a remote server: token → server id.
+    remote_sessions: HashMap<SessionToken, String>,
+    /// Maximum number of sessions this server will host (for load factor).
+    capacity: u32,
 }
 
 impl SessionRegistry {
@@ -21,19 +44,67 @@ impl SessionRegistry {
             sessions: HashMap::new(),
             token_index: HashMap::new(),
             next_id: 1,
+            local_server_id: String::new(),
+            remote_sessions: HashMap::new(),
+            capacity: DEFAULT_CAPACITY,
         }
     }
 
+    /// Create a registry with an explicit local server id and capacity.
+    pub fn with_cluster(local_server_id: impl Into<String>, capacity: u32) -> Self {
+        Self {
+            local_server_id: local_server_id.into(),
+            capacity: capacity.max(1),
+            ..Self::new()
+        }
+    }
+
+    /// This server's id (empty for single-server deployments).
+    pub fn local_server_id(&self) -> &str {
+        &self.local_server_id
+    }
+
+    /// Configured session capacity for this server.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Mark a token as living on a remote server (from cluster config or a
+    /// peer query). Used so a reconnecting client can be redirected home.
+    pub fn note_remote_session(&mut self, token: SessionToken, server_id: impl Into<String>) {
+        self.remote_sessions.insert(token, server_id.into());
+    }
+
+    /// Determine where the session bound to `token` lives.
+    pub fn locate(&self, token: &SessionToken) -> SessionLocation {
+        if let Some(id) = self.token_index.get(token) {
+            return SessionLocation::Local(*id);
+        }
+        if let Some(server_id) = self.remote_sessions.get(token) {
+            return SessionLocation::Remote(server_id.clone());
+        }
+        SessionLocation::Unknown
+    }
+
+    /// Current load factor: active sessions / capacity, clamped to [0, 1+].
+    pub fn load_factor(&self) -> f32 {
+        let active = self.count_by_state(SessionState::Active) as f32;
+        active / self.capacity.max(1) as f32
+    }
+
     /// Create a new session for the given token. Returns the session ID.
+    /// The session is stamped with this server's id as its `home_server`.
     pub fn create_session(&mut self, token: SessionToken) -> SessionId {
         let id = SessionId::from_raw(self.next_id);
         self.next_id += 1;
 
-        let session = Session::new(id, token.clone());
+        let session = Session::new(id, token.clone(), self.local_server_id.clone());
+        // A token we now host locally is no longer "remote".
+        self.remote_sessions.remove(&token);
         self.token_index.insert(token.clone(), id);
         self.sessions.insert(id, session);
 
-        info!(%id, %token, "session created");
+        info!(%id, %token, home_server = %self.local_server_id, "session created");
         id
     }
 
@@ -260,6 +331,62 @@ mod tests {
 
         // Unknown token → not resumable.
         assert_eq!(reg.is_resumable(&SessionToken::new("nope")), None);
+    }
+
+    #[test]
+    fn create_session_stamps_home_server() {
+        let mut reg = SessionRegistry::with_cluster("server-a", 50);
+        let id = reg.create_session(SessionToken::new("tok"));
+        assert_eq!(reg.get(id).unwrap().home_server, "server-a");
+    }
+
+    #[test]
+    fn locate_local_remote_unknown() {
+        let mut reg = SessionRegistry::with_cluster("server-a", 50);
+        let local_token = SessionToken::new("local-tok");
+        let id = reg.create_session(local_token.clone());
+
+        // Local session.
+        assert_eq!(reg.locate(&local_token), SessionLocation::Local(id));
+
+        // Remote session noted from cluster knowledge.
+        let remote_token = SessionToken::new("remote-tok");
+        reg.note_remote_session(remote_token.clone(), "server-b");
+        assert_eq!(
+            reg.locate(&remote_token),
+            SessionLocation::Remote("server-b".to_string())
+        );
+
+        // Unknown token.
+        assert_eq!(
+            reg.locate(&SessionToken::new("nope")),
+            SessionLocation::Unknown
+        );
+    }
+
+    #[test]
+    fn creating_local_clears_remote_marker() {
+        let mut reg = SessionRegistry::with_cluster("server-a", 50);
+        let token = SessionToken::new("tok");
+        reg.note_remote_session(token.clone(), "server-b");
+        let id = reg.create_session(token.clone());
+        // Now hosted locally; remote marker must be gone.
+        assert_eq!(reg.locate(&token), SessionLocation::Local(id));
+    }
+
+    #[test]
+    fn load_factor_computes_active_over_capacity() {
+        let mut reg = SessionRegistry::with_cluster("server-a", 4);
+        assert_eq!(reg.load_factor(), 0.0);
+
+        let id1 = reg.create_session(SessionToken::new("a"));
+        let id2 = reg.create_session(SessionToken::new("b"));
+        reg.activate(id1).unwrap();
+        reg.activate(id2).unwrap();
+        // 2 active / capacity 4 = 0.5
+        assert!((reg.load_factor() - 0.5).abs() < f32::EPSILON);
+        assert_eq!(reg.capacity(), 4);
+        assert_eq!(reg.local_server_id(), "server-a");
     }
 
     #[test]

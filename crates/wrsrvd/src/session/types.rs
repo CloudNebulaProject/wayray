@@ -101,11 +101,14 @@ pub struct Session {
     pub suspend_timeout: Duration,
     /// Username (set after authentication).
     pub user: Option<String>,
+    /// Id of the server that owns/created this session. Used by multi-server
+    /// support to redirect reconnecting clients to the home server.
+    pub home_server: String,
 }
 
 impl Session {
-    /// Create a new session in the Creating state.
-    pub fn new(id: SessionId, token: SessionToken) -> Self {
+    /// Create a new session in the Creating state, owned by `home_server`.
+    pub fn new(id: SessionId, token: SessionToken, home_server: impl Into<String>) -> Self {
         Self {
             id,
             token,
@@ -114,6 +117,7 @@ impl Session {
             suspended_at: None,
             suspend_timeout: Duration::from_secs(24 * 60 * 60), // 24 hours default
             user: None,
+            home_server: home_server.into(),
         }
     }
 
@@ -173,7 +177,11 @@ mod tests {
 
     #[test]
     fn valid_lifecycle_transitions() {
-        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("test-token"));
+        let mut session = Session::new(
+            SessionId::from_raw(1),
+            SessionToken::new("test-token"),
+            "local",
+        );
 
         assert_eq!(session.state, SessionState::Creating);
 
@@ -199,7 +207,7 @@ mod tests {
 
     #[test]
     fn invalid_transitions_rejected() {
-        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("t"));
+        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("t"), "local");
 
         // Creating → Suspended is invalid
         assert!(session.transition(SessionState::Suspended).is_err());
@@ -218,14 +226,14 @@ mod tests {
 
     #[test]
     fn creating_can_be_destroyed() {
-        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("t"));
+        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("t"), "local");
         // Creating → Destroyed (e.g., creation failed)
         session.transition(SessionState::Destroyed).unwrap();
     }
 
     #[test]
     fn suspend_timeout_tracking() {
-        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("t"));
+        let mut session = Session::new(SessionId::from_raw(1), SessionToken::new("t"), "local");
         session.transition(SessionState::Active).unwrap();
         session.transition(SessionState::Suspended).unwrap();
 

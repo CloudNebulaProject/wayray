@@ -1,0 +1,35 @@
+# WayRay multi-server cluster configuration (Feature 3.6).
+#
+# Static, config-driven server registry. WayRay deliberately avoids mDNS/DNS-SD
+# because those rely on platform multicast APIs or Avahi/Bonjour C libraries
+# that are absent or unreliable inside illumos zones, and multicast is commonly
+# disabled on the segmented networks SunRay-style deployments use. A static TOML
+# list plus a lightweight QUIC ServerInfo query needs zero extra dependencies
+# and compiles identically on illumos and Linux.
+#
+# Search order (first match wins):
+#   1. $XDG_CONFIG_HOME/wayray/cluster.toml  (or $HOME/.config/wayray/cluster.toml)
+#   2. /etc/wayray/cluster.toml              (system-wide; primary on illumos)
+#
+# Override on the server with:  wrsrvd --cluster /path/to/cluster.toml
+# Point a client at the cluster with:  wrclient --cluster /path/to/cluster.toml
+# (or pass repeated host:port positional arguments).
+#
+# An absent or empty config means single-server mode: sessions always bind
+# locally and no redirect/load-balancing logic runs.
+
+# This server's own id within the `servers` list below. On each server set this
+# to that server's id so it recognizes its own identity (and stamps it as the
+# `home_server` of sessions it creates).
+local_id = "a"
+
+[[servers]]
+id = "a"
+addr = "10.0.0.1:4433"
+# Relative placement weight for new-session load balancing (higher = preferred).
+weight = 1
+
+[[servers]]
+id = "b"
+addr = "10.0.0.2:4433"
+weight = 2
