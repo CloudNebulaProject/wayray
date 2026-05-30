@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use miette::Result;
 use smithay::{
@@ -28,6 +28,8 @@ use wayray_protocol::encoding;
 use wayray_protocol::messages::FrameUpdate;
 
 use wayray_protocol::cluster::ClusterConfig;
+use wayray_protocol::tls::PinStore;
+use wayray_protocol::tls::verifier::PinPolicy;
 
 use crate::errors::WayRayError;
 use crate::handlers::ClientState;
@@ -68,6 +70,26 @@ struct CalloopData {
     /// Small tokio runtime used for short-lived peer `ServerInfo` queries
     /// during new-session placement. `None` for single-server deployments.
     peer_rt: Option<tokio::runtime::Runtime>,
+    /// Trust-on-first-use pin store for peer certificates, used when a peer has
+    /// no fingerprint configured in `cluster.toml`.
+    peer_pin_store: Arc<Mutex<PinStore>>,
+}
+
+/// Maximum wall-clock the compositor thread will spend probing peers for a
+/// single connecting client. Bounds how long the calloop loop (rendering +
+/// input) can be blocked by cluster placement, independent of peer count.
+const PEER_PROBE_BUDGET: Duration = Duration::from_millis(250);
+
+/// Build the certificate-pin policy for a peer: a configured fingerprint is
+/// enforced strictly, otherwise trust-on-first-use against the shared store.
+fn peer_pin_policy(data: &CalloopData, server_id: &str, addr: &str) -> PinPolicy {
+    match data.cluster.fingerprint_of(server_id) {
+        Some(fp) => PinPolicy::Fixed(fp.to_string()),
+        None => PinPolicy::Tofu {
+            identity: addr.to_string(),
+            store: data.peer_pin_store.clone(),
+        },
+    }
 }
 
 /// Run the compositor with the headless PixmanRenderer backend.
@@ -196,6 +218,11 @@ pub fn run(
         active_session: None,
         cluster,
         peer_rt,
+        peer_pin_store: Arc::new(Mutex::new(PinStore::open_default().unwrap_or_else(|e| {
+            warn!(error = %e, "failed to open peer known_hosts; using temp store");
+            PinStore::open(std::env::temp_dir().join("wayray-peer-known_hosts"))
+                .expect("temp pin store")
+        }))),
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -261,8 +288,12 @@ fn drain_network_events(data: &mut CalloopData) {
                 let connect_received = std::time::Instant::now();
 
                 let token_str = hello.token.clone().unwrap_or_else(|| {
-                    // Generate a token if the client didn't provide one.
-                    format!("auto-{}", data.session_registry.list().count() + 1)
+                    // Generate a cryptographically random token if the client
+                    // didn't provide one. The token is the sole session
+                    // credential, so it must be unguessable: a sequential or
+                    // count-based scheme would let an attacker enumerate and
+                    // hijack other clients' tokenless sessions.
+                    generate_random_token()
                 });
                 let token = SessionToken::new(token_str);
 
@@ -313,10 +344,18 @@ fn drain_network_events(data: &mut CalloopData) {
                                 }
                             }
                             SessionState::Active => {
-                                // Hot-desk steal: previous endpoint never sent a
-                                // clean disconnect. Reuse the id without a state
-                                // transition (it is already Active).
-                                info!(%id, "session rebound to new endpoint (steal)");
+                                // Hot-desk steal: the previous endpoint never
+                                // sent a clean disconnect, so a new endpoint
+                                // presenting the same token rebinds the live
+                                // session. This is authorized purely by
+                                // possession of the (unguessable, TLS-protected)
+                                // token — the SunRay smart-card model — so log it
+                                // as a security-relevant takeover for auditing.
+                                warn!(
+                                    %id,
+                                    "active session rebound to a new endpoint (hot-desk takeover); \
+                                     authorized by session token"
+                                );
                             }
                             _ => {}
                         }
@@ -361,11 +400,11 @@ fn drain_network_events(data: &mut CalloopData) {
                     warn!("network thread dropped session binding reply channel");
                 }
 
+                // The token is a credential and is never logged in the clear.
                 info!(
                     version = hello.version,
                     %session_id,
                     resumed,
-                    %token,
                     resolve_us = connect_received.elapsed().as_micros() as u64,
                     "remote client connected"
                 );
@@ -421,7 +460,12 @@ fn discover_remote_home(data: &CalloopData, token: &SessionToken) -> Option<Stri
     if !data.cluster.is_clustered() {
         return None;
     }
+    if data.cluster.cluster_secret.is_empty() {
+        warn!("cluster configured without cluster_secret; skipping peer session lookup");
+        return None;
+    }
     let rt = data.peer_rt.as_ref()?;
+    let secret = data.cluster.cluster_secret.clone();
 
     let candidates: Vec<(String, String)> = data
         .cluster
@@ -429,7 +473,13 @@ fn discover_remote_home(data: &CalloopData, token: &SessionToken) -> Option<Stri
         .map(|s| (s.id.clone(), s.addr.clone()))
         .collect();
 
+    // Bound total probe time so a few dead peers cannot stall the event loop.
+    let deadline = Instant::now() + PEER_PROBE_BUDGET;
     for (id, addr) in candidates {
+        if Instant::now() >= deadline {
+            warn!("peer session-lookup budget exhausted; serving locally");
+            break;
+        }
         let socket: std::net::SocketAddr = match addr.parse() {
             Ok(s) => s,
             Err(e) => {
@@ -437,9 +487,11 @@ fn discover_remote_home(data: &CalloopData, token: &SessionToken) -> Option<Stri
                 continue;
             }
         };
-        if let Some(server_id) = rt.block_on(crate::network::query_peer_for_token(socket, &token.0))
-        {
-            info!(%token, %server_id, "discovered session home server via peer probe");
+        let policy = peer_pin_policy(data, &id, &addr);
+        if let Some(server_id) = rt.block_on(crate::network::query_peer_for_token(
+            socket, &token.0, &secret, policy,
+        )) {
+            info!(%server_id, "discovered session home server via peer probe");
             return Some(server_id);
         }
     }
@@ -489,7 +541,12 @@ fn pick_peer_for_new_session(data: &mut CalloopData) -> Option<(String, String)>
     if data.session_registry.load_factor() <= LOAD_REDIRECT_THRESHOLD {
         return None;
     }
+    if data.cluster.cluster_secret.is_empty() {
+        warn!("cluster configured without cluster_secret; skipping peer load probe");
+        return None;
+    }
     let rt = data.peer_rt.as_ref()?;
+    let secret = data.cluster.cluster_secret.clone();
 
     // Snapshot peer (id, addr) candidates.
     let candidates: Vec<(String, String)> = data
@@ -502,9 +559,15 @@ fn pick_peer_for_new_session(data: &mut CalloopData) -> Option<(String, String)>
     }
 
     // Query each peer's load (short-lived QUIC probes). Skip peers that fail
-    // to resolve or do not answer in time.
+    // to resolve or do not answer in time, and stop once the probe budget is
+    // spent so the event loop is never blocked for long.
+    let deadline = Instant::now() + PEER_PROBE_BUDGET;
     let mut loads: Vec<PeerLoad> = Vec::new();
     for (index, (id, addr)) in candidates.iter().enumerate() {
+        if Instant::now() >= deadline {
+            warn!("peer load-probe budget exhausted; placing locally");
+            break;
+        }
         let socket: std::net::SocketAddr = match addr.parse() {
             Ok(s) => s,
             Err(e) => {
@@ -513,7 +576,8 @@ fn pick_peer_for_new_session(data: &mut CalloopData) -> Option<(String, String)>
             }
         };
         let weight = data.cluster.server(id).map(|s| s.weight).unwrap_or(1);
-        if let Some(info) = rt.block_on(crate::network::query_peer_info(socket)) {
+        let policy = peer_pin_policy(data, id, addr);
+        if let Some(info) = rt.block_on(crate::network::query_peer_info(socket, &secret, policy)) {
             let cap = info.capacity.max(1) as f32;
             loads.push(PeerLoad {
                 index,
@@ -716,6 +780,15 @@ fn send_frame_to_network(
     // Store current frame as previous for next diff.
     data.previous_frame.clear();
     data.previous_frame.extend_from_slice(current_pixels);
+}
+
+/// Generate a cryptographically random 16-byte session token, hex-encoded.
+/// Used when a client connects without one. The value is the sole session
+/// credential, so it must be unguessable.
+fn generate_random_token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("failed to generate random session token");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Install a Ctrl-C handler that sets the running flag to false.

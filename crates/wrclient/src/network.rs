@@ -13,13 +13,15 @@
 //! data before the other side tries to accept.
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 
-use quinn::rustls::pki_types::CertificateDer;
 use tracing::info;
 use wayray_protocol::codec;
 use wayray_protocol::messages::{
     ClientHello, ControlMessage, DisplayMessage, InputMessage, ServerHello,
 };
+pub use wayray_protocol::tls::PinStore;
+use wayray_protocol::tls::verifier::{PinPolicy, PinnedServerCertVerifier};
 
 /// Configuration for the QUIC client connection.
 pub struct ClientConfig {
@@ -31,6 +33,13 @@ pub struct ClientConfig {
     pub capabilities: Vec<String>,
     /// Session token for session binding. If None, no token is sent.
     pub token: Option<String>,
+    /// Expected server certificate fingerprint (`sha256:<hex>`). When set, the
+    /// connection is pinned strictly to it. When `None`, trust-on-first-use
+    /// against `pin_store` applies.
+    pub expected_fingerprint: Option<String>,
+    /// Shared trust-on-first-use pin store. Required when no fingerprint is
+    /// configured so the client never blindly accepts an unknown certificate.
+    pub pin_store: Arc<Mutex<PinStore>>,
 }
 
 /// Resolve a "host:port" string to a SocketAddr, supporting both
@@ -58,17 +67,6 @@ pub fn resolve_server_addr(addr_str: &str) -> Result<(SocketAddr, String), Strin
         .unwrap_or_else(|| addr_str.to_string());
 
     Ok((*addr, hostname))
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "127.0.0.1:4433".parse().unwrap(),
-            server_name: "localhost".to_string(),
-            capabilities: vec!["display".to_string()],
-            token: None,
-        }
-    }
 }
 
 /// Outcome of a connection attempt: either an established session or a
@@ -145,58 +143,28 @@ impl ServerConnection {
     }
 }
 
-/// Dummy certificate verifier that accepts any server cert.
+/// Build a quinn client config that pins the server certificate.
 ///
-/// Used during development when servers use self-signed certificates.
-/// TODO: Replace with proper certificate pinning or CA verification.
-#[derive(Debug)]
-struct SkipServerVerification;
+/// A configured fingerprint is enforced strictly; otherwise the connection is
+/// trusted on first use and pinned in the shared store. Either way the server
+/// can no longer be silently impersonated by a man-in-the-middle (which would
+/// otherwise harvest the session token sent in the `ClientHello`).
+fn build_client_config(config: &ClientConfig) -> quinn::ClientConfig {
+    let policy = match &config.expected_fingerprint {
+        Some(fp) => PinPolicy::Fixed(fp.clone()),
+        None => PinPolicy::Tofu {
+            identity: config.server_addr.to_string(),
+            store: config.pin_store.clone(),
+        },
+    };
+    let verifier = Arc::new(PinnedServerCertVerifier::new(policy));
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-/// Build a quinn client config that skips certificate verification.
-fn build_client_config() -> quinn::ClientConfig {
     let provider = rustls::crypto::ring::default_provider();
     let crypto = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
         .expect("TLS protocol versions")
         .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .expect("QUIC client crypto config");
@@ -211,7 +179,7 @@ fn build_client_config() -> quinn::ClientConfig {
 /// The caller must keep the returned `quinn::Endpoint` alive for the
 /// duration of the connection.
 pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn std::error::Error>> {
-    let client_config = build_client_config();
+    let client_config = build_client_config(config);
 
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
     endpoint.set_default_client_config(client_config);
@@ -240,13 +208,13 @@ pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn st
     let response: ControlMessage = read_message(&mut control_recv).await?;
     let server_hello = match response {
         ControlMessage::ServerHello(hello) => {
+            // The token is a session credential — never log it in the clear.
             info!(
                 version = hello.version,
                 session_id = hello.session_id,
                 width = hello.output_width,
                 height = hello.output_height,
                 resumed = hello.resumed,
-                token = %hello.token,
                 "received ServerHello"
             );
             hello
@@ -312,7 +280,18 @@ pub async fn read_display_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quinn::rustls::pki_types::CertificateDer;
     use wayray_protocol::messages::{FrameUpdate, KeyState, KeyboardEvent};
+
+    /// A throwaway trust-on-first-use pin store backed by a unique temp file, so
+    /// tests pin the self-signed test cert without touching the real
+    /// `known_hosts` or accepting arbitrary certificates.
+    fn temp_pin_store(tag: &str) -> Arc<Mutex<PinStore>> {
+        let path =
+            std::env::temp_dir().join(format!("wayray-test-pins-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Arc::new(Mutex::new(PinStore::open(path).unwrap()))
+    }
 
     /// Helper: start a test server on an ephemeral port, return its address.
     async fn start_test_server() -> (quinn::Endpoint, SocketAddr) {
@@ -380,6 +359,8 @@ mod tests {
             server_name: "localhost".to_string(),
             capabilities: vec!["test".to_string()],
             token: Some("test-token".to_string()),
+            expected_fingerprint: None,
+            pin_store: temp_pin_store("handshake"),
         };
 
         let (_endpoint, mut conn) = match connect(&config).await.unwrap() {
@@ -439,6 +420,8 @@ mod tests {
             server_name: "localhost".to_string(),
             capabilities: vec![],
             token: None,
+            expected_fingerprint: None,
+            pin_store: temp_pin_store("frame"),
         };
 
         let (_endpoint, mut conn) = match connect(&config).await.unwrap() {
@@ -490,6 +473,8 @@ mod tests {
             server_name: "localhost".to_string(),
             capabilities: vec![],
             token: Some("remote-token".to_string()),
+            expected_fingerprint: None,
+            pin_store: temp_pin_store("redirect"),
         };
 
         match connect(&config).await.unwrap() {

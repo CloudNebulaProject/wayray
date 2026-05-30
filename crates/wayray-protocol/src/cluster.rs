@@ -43,6 +43,11 @@ pub struct ServerEntry {
     /// is preferred for new sessions. Defaults to `1`.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Expected TLS certificate fingerprint (`sha256:<hex>`) for this server.
+    /// When set, the peer/redirect connection is pinned strictly to it; a
+    /// mismatch aborts the handshake. When empty, trust-on-first-use applies.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 fn default_weight() -> u32 {
@@ -56,6 +61,14 @@ pub struct ClusterConfig {
     /// This server's own id within the `servers` list. Empty when running as a
     /// standalone single-server deployment.
     pub local_id: String,
+    /// Shared secret that authenticates intra-cluster control probes
+    /// (`ServerInfoRequest` / `SessionLookupRequest`). Every server in a cluster
+    /// must be configured with the same value. When empty, a server refuses to
+    /// answer peer probes at all — clustering is therefore secure by default and
+    /// requires an explicit secret. This prevents an unauthenticated party from
+    /// using the session-lookup path as a token-existence oracle.
+    #[serde(default)]
+    pub cluster_secret: String,
     /// All servers participating in the cluster.
     pub servers: Vec<ServerEntry>,
 }
@@ -107,6 +120,14 @@ impl ClusterConfig {
     /// Resolve a server id to its address.
     pub fn addr_of(&self, id: &str) -> Option<&str> {
         self.server(id).map(|s| s.addr.as_str())
+    }
+
+    /// Configured certificate fingerprint pin for a server id, if any
+    /// (non-empty). `None` selects trust-on-first-use for that peer.
+    pub fn fingerprint_of(&self, id: &str) -> Option<&str> {
+        self.server(id)
+            .map(|s| s.fingerprint.as_str())
+            .filter(|f| !f.is_empty())
     }
 
     /// Peers other than the local server.

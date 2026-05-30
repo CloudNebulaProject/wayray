@@ -7,9 +7,19 @@
 # are exercised even in this single-node test deployment.
 local_id = "srv-a"
 
+# Shared secret authenticating intra-cluster control probes (ServerInfo /
+# SessionLookup). Every server in the cluster must use the same value; without
+# it a server refuses to answer peer probes (secure-by-default), which also
+# closes the token-existence oracle. Use a real secret in production.
+cluster_secret = "wayray-demo-cluster-secret"
+
 [[servers]]
 id = "srv-a"
 addr = "wrsrvd:4433"
+# Optionally pin each server's TLS cert fingerprint (sha256:<hex>) for strict
+# verification; the server logs its fingerprint at startup. When omitted,
+# clients/peers trust-on-first-use and record it in known_hosts.
+# fingerprint = "sha256:..."
 weight = 1
 
 # A second, intentionally-unreachable peer so load-balancing / placement logic

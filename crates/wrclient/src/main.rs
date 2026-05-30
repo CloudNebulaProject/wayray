@@ -8,9 +8,10 @@ pub mod display;
 pub mod input;
 pub mod network;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
@@ -300,24 +301,34 @@ enum ConnectResult {
 /// [`MAX_REDIRECTS`] `SessionRedirect` responses (multi-server affinity / load
 /// balancing). The same token is reused on every hop and every candidate so
 /// the home server resumes the session.
+///
+/// Redirect targets are validated against `allowed` — the set of addresses the
+/// client already trusts (its candidates / cluster config). A redirect to any
+/// other address is refused: otherwise a compromised or impersonated server
+/// could send the client (and its session token) to an attacker-controlled
+/// host. The server's certificate is pinned via `pin_store` (TOFU) or a
+/// configured per-candidate fingerprint.
 async fn connect_following_redirects(
-    candidates: &[(SocketAddr, String)],
+    candidates: &[Candidate],
     token: &Option<String>,
     first_attempt: bool,
+    pin_store: &Arc<Mutex<network::PinStore>>,
+    allowed: &HashMap<SocketAddr, Candidate>,
 ) -> ConnectResult {
     let mut last_error: Option<String> = None;
 
-    for (cand_idx, (cand_addr, cand_name)) in candidates.iter().enumerate() {
+    for (cand_idx, candidate) in candidates.iter().enumerate() {
         // Each candidate gets its own redirect chain.
-        let mut server_addr = *cand_addr;
-        let mut server_name = cand_name.clone();
+        let mut hop_target = candidate.clone();
 
         for hop in 0..=MAX_REDIRECTS {
             let config = ClientConfig {
-                server_addr,
-                server_name: server_name.clone(),
+                server_addr: hop_target.addr,
+                server_name: hop_target.name.clone(),
                 capabilities: vec!["display".to_string()],
                 token: token.clone(),
+                expected_fingerprint: hop_target.fingerprint.clone(),
+                pin_store: pin_store.clone(),
             };
 
             match network::connect(&config).await {
@@ -331,9 +342,26 @@ async fn connect_following_redirects(
                     }
                     match network::resolve_server_addr(&addr) {
                         Ok((resolved, name)) => {
-                            info!(%server_id, target = %resolved, hop, "following redirect");
-                            server_addr = resolved;
-                            server_name = name;
+                            // Only follow redirects to servers we already trust.
+                            // An untrusted target must never receive our token.
+                            match allowed.get(&resolved) {
+                                Some(known) => {
+                                    info!(%server_id, target = %resolved, hop, "following redirect");
+                                    hop_target = Candidate {
+                                        addr: resolved,
+                                        name: known.name.clone(),
+                                        fingerprint: known.fingerprint.clone(),
+                                    };
+                                    let _ = name; // resolved name superseded by trusted entry
+                                }
+                                None => {
+                                    warn!(
+                                        %server_id, %addr,
+                                        "refusing redirect to address outside the trusted cluster set"
+                                    );
+                                    break; // try the next candidate
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!(%server_id, %addr, error = %e, "cannot resolve redirect target");
@@ -357,18 +385,39 @@ async fn connect_following_redirects(
     ConnectResult::Retry
 }
 
+/// A server the client may connect to, with its TLS pin policy.
+#[derive(Clone)]
+struct Candidate {
+    /// Resolved socket address.
+    addr: SocketAddr,
+    /// TLS SNI / pin identity name.
+    name: String,
+    /// Configured certificate fingerprint (`sha256:<hex>`), if any. `None`
+    /// selects trust-on-first-use for this server.
+    fingerprint: Option<String>,
+}
+
 /// Parse the server candidate list from CLI args: positional `host:port`
 /// entries plus every server listed in a `--cluster <path>` cluster.toml.
-/// Each entry is resolved to a `(SocketAddr, server_name)` pair; unresolvable
-/// entries are skipped with a warning.
-fn parse_server_candidates(args: &[String]) -> Vec<(SocketAddr, String)> {
-    let mut candidates = Vec::new();
+/// Cluster entries carry any configured certificate fingerprint so the
+/// connection can be pinned strictly. Unresolvable entries are skipped.
+///
+/// An explicit `--server-fingerprint <sha256:..>` applies to positional
+/// candidates (the common single-server case).
+fn parse_server_candidates(args: &[String]) -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    let cli_fingerprint = args
+        .iter()
+        .position(|a| a == "--server-fingerprint")
+        .and_then(|pos| args.get(pos + 1))
+        .cloned();
 
     // Positional args (everything that is not a flag or a flag value).
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if a == "--token" || a == "--cluster" {
+        if a == "--token" || a == "--cluster" || a == "--server-fingerprint" {
             i += 2; // skip the flag and its value
             continue;
         }
@@ -377,7 +426,11 @@ fn parse_server_candidates(args: &[String]) -> Vec<(SocketAddr, String)> {
             continue;
         }
         match network::resolve_server_addr(a) {
-            Ok((addr, name)) => candidates.push((addr, name)),
+            Ok((addr, name)) => candidates.push(Candidate {
+                addr,
+                name,
+                fingerprint: cli_fingerprint.clone(),
+            }),
             Err(e) => warn!(arg = %a, error = %e, "skipping unresolvable server address"),
         }
         i += 1;
@@ -392,8 +445,14 @@ fn parse_server_candidates(args: &[String]) -> Vec<(SocketAddr, String)> {
                 for server in &cluster.servers {
                     match network::resolve_server_addr(&server.addr) {
                         Ok((addr, name)) => {
-                            if !candidates.iter().any(|(a, _)| *a == addr) {
-                                candidates.push((addr, name));
+                            if !candidates.iter().any(|c| c.addr == addr) {
+                                let fingerprint = (!server.fingerprint.is_empty())
+                                    .then(|| server.fingerprint.clone());
+                                candidates.push(Candidate {
+                                    addr,
+                                    name,
+                                    fingerprint,
+                                });
                             }
                         }
                         Err(e) => {
@@ -431,10 +490,9 @@ fn load_or_generate_token() -> String {
     getrandom::fill(&mut bytes).expect("failed to generate random token");
     let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
 
-    // Persist it.
-    if let Err(e) = std::fs::create_dir_all(&config_dir) {
-        warn!(error = %e, "failed to create config dir");
-    } else if let Err(e) = std::fs::write(&token_path, &token) {
+    // Persist it with owner-only permissions: the token is a session
+    // credential and must not be world-readable.
+    if let Err(e) = wayray_protocol::tls::write_private(&token_path, token.as_bytes()) {
         warn!(error = %e, "failed to persist token");
     } else {
         info!(path = %token_path.display(), "session token persisted");
@@ -478,14 +536,32 @@ fn main() {
     let candidates = parse_server_candidates(&args);
     if candidates.is_empty() {
         eprintln!(
-            "Usage: wrclient <host>:<port> [<host>:<port> ...] [--token <token>] [--cluster <path>]"
+            "Usage: wrclient <host>:<port> [<host>:<port> ...] [--token <token>] [--cluster <path>] [--server-fingerprint <sha256:..>]"
         );
         std::process::exit(1);
     }
 
+    // The set of server addresses the client trusts. Redirects are only
+    // followed to one of these, so an impersonated server cannot send the
+    // session token to an arbitrary host.
+    let allowed: HashMap<SocketAddr, Candidate> =
+        candidates.iter().map(|c| (c.addr, c.clone())).collect();
+
+    // Shared trust-on-first-use pin store, so the client never blindly accepts
+    // an unknown server certificate (MITM protection for the session token).
+    let pin_store = Arc::new(Mutex::new(
+        network::PinStore::open_default().unwrap_or_else(|e| {
+            warn!(error = %e, "failed to open known_hosts pin store; using an empty in-memory store");
+            network::PinStore::open(std::env::temp_dir().join("wayray-known_hosts"))
+                .expect("temp pin store")
+        }),
+    ));
+
+    // The token is a session credential; log only whether one is set, never
+    // its value.
     info!(
         candidates = candidates.len(),
-        token = ?token,
+        has_token = token.is_some(),
         "connecting to server (trying candidates in order)"
     );
 
@@ -528,29 +604,35 @@ fn main() {
                     // Connect, trying candidates in order and following redirects
                     // (capped) to the server that owns our session or a
                     // less-loaded peer.
-                    let (_endpoint, mut conn) =
-                        match connect_following_redirects(&candidates, &token, first_attempt).await
-                        {
-                            ConnectResult::Connected(boxed) => {
-                                let (ep, conn) = *boxed;
-                                (ep, conn)
-                            }
-                            ConnectResult::FatalFirstAttempt => {
-                                // Unblock the main thread on the very first try.
-                                let _ = dim_tx.send((0, 0));
-                                return;
-                            }
-                            ConnectResult::Retry => {
-                                warn!(
-                                    backoff_ms = backoff.as_millis() as u64,
-                                    "reconnect failed, retrying"
-                                );
-                                tokio::time::sleep(backoff).await;
-                                backoff = (backoff * 2)
-                                    .min(std::time::Duration::from_millis(MAX_BACKOFF_MS));
-                                continue;
-                            }
-                        };
+                    let (_endpoint, mut conn) = match connect_following_redirects(
+                        &candidates,
+                        &token,
+                        first_attempt,
+                        &pin_store,
+                        &allowed,
+                    )
+                    .await
+                    {
+                        ConnectResult::Connected(boxed) => {
+                            let (ep, conn) = *boxed;
+                            (ep, conn)
+                        }
+                        ConnectResult::FatalFirstAttempt => {
+                            // Unblock the main thread on the very first try.
+                            let _ = dim_tx.send((0, 0));
+                            return;
+                        }
+                        ConnectResult::Retry => {
+                            warn!(
+                                backoff_ms = backoff.as_millis() as u64,
+                                "reconnect failed, retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff =
+                                (backoff * 2).min(std::time::Duration::from_millis(MAX_BACKOFF_MS));
+                            continue;
+                        }
+                    };
 
                     first_attempt = false;
                     // Successful connection resets the backoff.

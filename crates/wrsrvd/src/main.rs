@@ -100,6 +100,7 @@ fn main() -> Result<()> {
         output_height: output_size.h as u32,
         server_id: cluster.local_id.clone(),
         capacity: wayray_protocol::cluster::DEFAULT_CAPACITY,
+        cluster_secret: cluster.cluster_secret.clone(),
         ..ServerConfig::default()
     });
     info!("QUIC network server started");

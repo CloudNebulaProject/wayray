@@ -32,6 +32,7 @@ use wayray_protocol::messages::{
     ClientHello, ControlMessage, DisplayMessage, FrameUpdate, InputMessage, ServerHello,
     ServerInfoMsg, SessionEvent, SessionLookupResponse,
 };
+use wayray_protocol::tls::verifier::{PinPolicy, PinnedServerCertVerifier};
 
 /// Set of session tokens this server currently hosts in a resumable state.
 ///
@@ -108,6 +109,11 @@ pub struct ServerConfig {
     /// Session capacity reported in `ServerInfo` responses (for load
     /// balancing). Defaults to [`DEFAULT_CAPACITY`].
     pub capacity: u32,
+    /// Shared secret that authenticates intra-cluster control probes. A peer's
+    /// `ServerInfoRequest`/`SessionLookupRequest` is answered only when it
+    /// presents this exact value. Empty means "answer no peer probes" — the
+    /// secure single-server default that also closes the token-lookup oracle.
+    pub cluster_secret: String,
 }
 
 impl Default for ServerConfig {
@@ -118,8 +124,17 @@ impl Default for ServerConfig {
             output_height: 720,
             server_id: String::new(),
             capacity: wayray_protocol::cluster::DEFAULT_CAPACITY,
+            cluster_secret: String::new(),
         }
     }
+}
+
+/// Whether a peer probe carrying `auth` is authorized against this server's
+/// configured cluster secret. An empty configured secret authorizes nothing,
+/// so a server never answers probes unless an operator opts into clustering by
+/// setting a shared secret.
+fn peer_authenticated(configured_secret: &str, auth: &str) -> bool {
+    !configured_secret.is_empty() && auth == configured_secret
 }
 
 /// Handle to a running network server thread.
@@ -174,19 +189,60 @@ impl Drop for NetworkHandle {
     }
 }
 
-/// Generate a self-signed TLS certificate for the QUIC server.
-fn generate_self_signed_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+/// Directory holding the server's persistent identity (certificate + key).
+/// Prefers `$XDG_CONFIG_HOME/wayray` (or `$HOME/.config/wayray`), falling back
+/// to `/etc/wayray` (the primary location on illumos).
+fn cert_dir() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return std::path::PathBuf::from(xdg).join("wayray");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".config")
+            .join("wayray");
+    }
+    std::path::PathBuf::from("/etc/wayray")
+}
+
+/// Load the server's persistent self-signed certificate, generating and saving
+/// it on first run. Persisting the certificate keeps its fingerprint stable
+/// across restarts so clients and peers can pin it (otherwise a fresh cert each
+/// boot would defeat trust-on-first-use). The private key is written `0600`.
+fn load_or_generate_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let dir = cert_dir();
+    let cert_path = dir.join("cert.der");
+    let key_path = dir.join("key.der");
+
+    if let (Ok(cert_bytes), Ok(key_bytes)) = (std::fs::read(&cert_path), std::fs::read(&key_path))
+        && let Ok(key) = PrivateKeyDer::try_from(key_bytes)
+    {
+        let cert = CertificateDer::from(cert_bytes);
+        return (vec![cert], key);
+    }
+
+    // Generate a fresh self-signed identity and persist it.
     let CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "wayray".to_string()])
             .expect("certificate generation failed");
     let cert_der = CertificateDer::from(cert);
     let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).expect("key serialization");
+
+    if let Err(e) = std::fs::write(&cert_path, cert_der.as_ref())
+        .and_then(|_| wayray_protocol::tls::write_private(&key_path, &key_pair.serialize_der()))
+    {
+        warn!(error = %e, dir = %dir.display(), "could not persist server certificate; using an ephemeral one (clients must re-pin after restart)");
+    } else {
+        info!(dir = %dir.display(), "persisted server certificate identity");
+    }
+
     (vec![cert_der], key_der)
 }
 
-/// Build a quinn `ServerConfig` from a self-signed cert.
-fn build_server_config() -> quinn::ServerConfig {
-    let (certs, key) = generate_self_signed_cert();
+/// Build a quinn `ServerConfig` from the persistent self-signed cert, returning
+/// the certificate's SHA-256 fingerprint so it can be logged for pinning.
+fn build_server_config() -> (quinn::ServerConfig, String) {
+    let (certs, key) = load_or_generate_cert();
+    let fingerprint = wayray_protocol::tls::fingerprint(certs[0].as_ref());
     let provider = rustls::crypto::ring::default_provider();
     let crypto = rustls::ServerConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
@@ -196,7 +252,10 @@ fn build_server_config() -> quinn::ServerConfig {
         .expect("TLS server config");
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .expect("QUIC server crypto config");
-    quinn::ServerConfig::with_crypto(std::sync::Arc::new(crypto))
+    (
+        quinn::ServerConfig::with_crypto(std::sync::Arc::new(crypto)),
+        fingerprint,
+    )
 }
 
 /// Start the QUIC server on a background thread.
@@ -236,73 +295,203 @@ pub fn start_server(config: ServerConfig) -> NetworkHandle {
     }
 }
 
+/// A real client connection routed back to the single client handler after its
+/// `ClientHello` has been read (probes are answered separately and never reach
+/// here).
+struct RoutedClient {
+    connection: quinn::Connection,
+    control_send: quinn::SendStream,
+    control_recv: quinn::RecvStream,
+    hello: ClientHello,
+}
+
 /// Main server accept loop.
+///
+/// Connections are accepted on a dedicated task so short-lived peer probes
+/// (`ServerInfoRequest` / `SessionLookupRequest`) are answered concurrently —
+/// even while a client session is active. Real clients are routed back to this
+/// loop and served one at a time (there is a single compositor).
 async fn server_loop(
     config: ServerConfig,
     compositor_rx: mpsc::Receiver<CompositorToNet>,
     compositor_tx: mpsc::Sender<NetToCompositor>,
     active_sessions: Arc<AtomicU32>,
     local_tokens: LocalTokens,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let server_config = build_server_config();
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (server_config, fingerprint) = build_server_config();
     let endpoint = quinn::Endpoint::server(server_config, config.bind_addr)?;
-    info!(addr = %config.bind_addr, "QUIC server listening");
+    info!(
+        addr = %config.bind_addr,
+        %fingerprint,
+        "QUIC server listening; pin this certificate fingerprint on clients and peers"
+    );
+
+    let config = Arc::new(config);
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<RoutedClient>(1);
+
+    // Dedicated acceptor: keeps accepting (and answering probes) regardless of
+    // whether a client session is currently being served.
+    let accept_task = tokio::spawn(accept_loop(
+        endpoint.clone(),
+        config.clone(),
+        active_sessions,
+        local_tokens,
+        client_tx,
+    ));
 
     loop {
-        // Check for shutdown before waiting for connection.
-        if let Ok(CompositorToNet::Shutdown) = compositor_rx.try_recv() {
-            info!("network: shutdown requested");
-            break;
-        }
-
-        let incoming = tokio::select! {
-            incoming = endpoint.accept() => {
-                match incoming {
-                    Some(incoming) => incoming,
+        tokio::select! {
+            routed = client_rx.recv() => {
+                match routed {
+                    Some(rc) => {
+                        info!(remote = %rc.connection.remote_address(), "client session starting");
+                        if let Err(e) = serve_client(rc, &config, &compositor_rx, &compositor_tx).await {
+                            warn!("client session ended: {e}");
+                        }
+                        let _ = compositor_tx.send(NetToCompositor::ClientDisconnected);
+                        info!("client disconnected, waiting for next connection");
+                    }
                     None => {
-                        info!("QUIC endpoint closed");
+                        info!("acceptor stopped");
                         break;
                     }
                 }
             }
             _ = check_shutdown_async(&compositor_rx) => {
-                info!("network: shutdown during accept");
+                info!("network: shutdown requested");
                 break;
             }
-        };
+        }
+    }
 
-        let connection = match incoming.await {
-            Ok(conn) => conn,
-            Err(e) => {
-                warn!("failed to accept connection: {e}");
-                continue;
+    accept_task.abort();
+    endpoint.close(0u32.into(), b"shutdown");
+    Ok(())
+}
+
+/// Accept connections forever, spawning a classifier task per connection so
+/// peer probes resolve concurrently. Client connections are forwarded over
+/// `client_tx` to the single client handler.
+async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    config: Arc<ServerConfig>,
+    active_sessions: Arc<AtomicU32>,
+    local_tokens: LocalTokens,
+    client_tx: tokio::sync::mpsc::Sender<RoutedClient>,
+) {
+    loop {
+        let incoming = match endpoint.accept().await {
+            Some(incoming) => incoming,
+            None => {
+                info!("QUIC endpoint closed");
+                return;
             }
         };
 
-        info!(
-            remote = %connection.remote_address(),
-            "client connected"
-        );
+        let config = config.clone();
+        let active_sessions = active_sessions.clone();
+        let local_tokens = local_tokens.clone();
+        let client_tx = client_tx.clone();
 
-        if let Err(e) = handle_connection(
-            &connection,
-            &config,
-            &compositor_rx,
-            &compositor_tx,
-            &active_sessions,
-            &local_tokens,
-        )
-        .await
-        {
-            warn!("client session ended: {e}");
-        }
+        tokio::spawn(async move {
+            let connection = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    warn!("failed to accept connection: {e}");
+                    return;
+                }
+            };
 
-        let _ = compositor_tx.send(NetToCompositor::ClientDisconnected);
-        info!("client disconnected, waiting for next connection");
+            match classify_connection(&connection, &config, &active_sessions, &local_tokens).await {
+                Ok(Some((control_send, control_recv, hello))) => {
+                    let routed = RoutedClient {
+                        connection,
+                        control_send,
+                        control_recv,
+                        hello,
+                    };
+                    if client_tx.send(routed).await.is_err() {
+                        warn!("client router closed; dropping connection");
+                    }
+                }
+                Ok(None) => {
+                    // A probe was answered; keep the connection alive briefly so
+                    // the buffered response is delivered before it drops.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        connection.closed(),
+                    )
+                    .await;
+                }
+                Err(e) => warn!("connection classification failed: {e}"),
+            }
+        });
     }
+}
 
-    endpoint.close(0u32.into(), b"shutdown");
-    Ok(())
+/// Accept the control stream and read the first message, classifying the
+/// connection. Peer probes are authenticated against the cluster secret and
+/// answered in place (returning `Ok(None)`); a `ClientHello` is returned for the
+/// caller to serve. Answering an unauthenticated probe would expose a
+/// token-existence oracle, so unauthenticated probes are refused without reply.
+async fn classify_connection(
+    connection: &quinn::Connection,
+    config: &ServerConfig,
+    active_sessions: &Arc<AtomicU32>,
+    local_tokens: &LocalTokens,
+) -> Result<
+    Option<(quinn::SendStream, quinn::RecvStream, ClientHello)>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    // The peer writes its first control message immediately after opening, so
+    // accept_bi resolves once that data arrives.
+    let (mut control_send, mut control_recv) = connection.accept_bi().await?;
+
+    let first: ControlMessage = read_message(&mut control_recv).await?;
+    match first {
+        ControlMessage::ClientHello(hello) => {
+            info!(version = hello.version, "received ClientHello");
+            Ok(Some((control_send, control_recv, hello)))
+        }
+        ControlMessage::ServerInfoRequest { auth } => {
+            if !peer_authenticated(&config.cluster_secret, &auth) {
+                warn!("rejected unauthenticated ServerInfo probe");
+                return Ok(None);
+            }
+            let info = ControlMessage::ServerInfo(ServerInfoMsg {
+                server_id: config.server_id.clone(),
+                active_sessions: active_sessions.load(Ordering::Relaxed),
+                capacity: config.capacity,
+            });
+            write_message(&mut control_send, &info).await?;
+            let _ = control_send.finish();
+            info!("answered ServerInfo probe");
+            Ok(None)
+        }
+        ControlMessage::SessionLookupRequest { token, auth } => {
+            if !peer_authenticated(&config.cluster_secret, &auth) {
+                warn!("rejected unauthenticated SessionLookup probe");
+                return Ok(None);
+            }
+            let hosts = local_tokens
+                .lock()
+                .map(|t| t.contains(&token))
+                .unwrap_or(false);
+            let resp = ControlMessage::SessionLookupResponse(SessionLookupResponse {
+                server_id: config.server_id.clone(),
+                hosts,
+            });
+            write_message(&mut control_send, &resp).await?;
+            let _ = control_send.finish();
+            // The token is never logged: only the boolean result and server id.
+            info!(hosts, "answered SessionLookup probe");
+            Ok(None)
+        }
+        other => Err(format!(
+            "expected ClientHello, ServerInfoRequest, or SessionLookupRequest, got {other:?}"
+        )
+        .into()),
+    }
 }
 
 /// Await a `ConnectDecision` reply from the compositor, polling the blocking
@@ -341,74 +530,34 @@ async fn check_shutdown_async(rx: &mpsc::Receiver<CompositorToNet>) {
     }
 }
 
-/// Handle a single client connection: handshake on control stream, then
-/// relay messages between compositor and client until disconnect.
+/// Serve a routed client: resolve its session binding with the compositor, send
+/// `ServerHello`, then relay messages until disconnect.
 ///
 /// Stream setup protocol (accounts for quinn's lazy stream creation):
-/// 1. Client opens bidi stream and immediately sends `ClientHello` (triggers
-///    server's `accept_bi`).
-/// 2. Server reads `ClientHello`, sends `ServerHello` on control stream.
-/// 3. Server opens display uni stream and sends an initial empty frame
-///    (triggers client's `accept_uni` for display).
-/// 4. Client opens input uni stream — server's `accept_uni` for input is
-///    handled asynchronously when the client first writes input data.
-async fn handle_connection(
-    connection: &quinn::Connection,
+/// 1. Client opened a bidi stream and sent `ClientHello` (already read by
+///    `classify_connection`).
+/// 2. Server sends `ServerHello` on the control stream.
+/// 3. Server opens the display uni stream and sends frames.
+/// 4. Client opens the input uni stream — accepted when it first writes input.
+async fn serve_client(
+    routed: RoutedClient,
     config: &ServerConfig,
     compositor_rx: &mpsc::Receiver<CompositorToNet>,
     compositor_tx: &mpsc::Sender<NetToCompositor>,
-    active_sessions: &Arc<AtomicU32>,
-    local_tokens: &LocalTokens,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Accept control stream. The peer writes its first control message
-    // immediately after opening, so accept_bi resolves once that data arrives.
-    let (mut control_send, mut control_recv) = connection.accept_bi().await?;
-    info!("control stream established");
-
-    // Step 2: Read the first control message. A peer load-balancing probe sends
-    // `ServerInfoRequest` and expects a `ServerInfo` reply; a real client sends
-    // `ClientHello`.
-    let first: ControlMessage = read_message(&mut control_recv).await?;
-    let hello = match first {
-        ControlMessage::ClientHello(hello) => hello,
-        ControlMessage::ServerInfoRequest => {
-            let info = ControlMessage::ServerInfo(ServerInfoMsg {
-                server_id: config.server_id.clone(),
-                active_sessions: active_sessions.load(Ordering::Relaxed),
-                capacity: config.capacity,
-            });
-            write_message(&mut control_send, &info).await?;
-            info!("answered ServerInfo probe");
-            return Ok(());
-        }
-        ControlMessage::SessionLookupRequest { token } => {
-            let hosts = local_tokens
-                .lock()
-                .map(|t| t.contains(&token))
-                .unwrap_or(false);
-            let resp = ControlMessage::SessionLookupResponse(SessionLookupResponse {
-                server_id: config.server_id.clone(),
-                hosts,
-            });
-            write_message(&mut control_send, &resp).await?;
-            info!(%token, hosts, "answered SessionLookup probe");
-            return Ok(());
-        }
-        other => {
-            return Err(format!(
-                "expected ClientHello, ServerInfoRequest, or SessionLookupRequest, got {other:?}"
-            )
-            .into());
-        }
-    };
-    info!(version = hello.version, "received ClientHello");
-    let fallback_token = hello.token.clone().unwrap_or_default();
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let RoutedClient {
+        connection,
+        mut control_send,
+        mut control_recv,
+        hello,
+    } = routed;
 
     // Round-trip to the compositor: it resolves the session via the registry
     // and replies with either a binding (serve here) or a redirect (the session
-    // lives on another server / load balancing). We bound the wait so a stalled
-    // compositor cannot wedge the handshake; on timeout we fall back to a
-    // best-effort local ServerHello.
+    // lives on another server / load balancing). The wait is generously bounded
+    // so a brief compositor-side peer probe cannot wedge the handshake; on
+    // timeout we abort the connection rather than fabricate a bogus session id
+    // (the client will retry).
     let (reply_tx, reply_rx) = mpsc::channel::<ConnectDecision>();
     let connect_start = std::time::Instant::now();
     let _ = compositor_tx.send(NetToCompositor::ClientConnected {
@@ -416,7 +565,8 @@ async fn handle_connection(
         reply: reply_tx,
     });
 
-    let decision = recv_binding_with_timeout(reply_rx, std::time::Duration::from_millis(250)).await;
+    let decision =
+        recv_binding_with_timeout(reply_rx, std::time::Duration::from_millis(3000)).await;
     let (session_id, resumed, token) = match decision {
         Some(ConnectDecision::Bind(b)) => {
             info!(
@@ -437,8 +587,9 @@ async fn handle_connection(
             return Ok(());
         }
         None => {
-            warn!("timed out waiting for session binding; using fallback ServerHello");
-            (0, false, fallback_token)
+            return Err(
+                "timed out waiting for session binding from compositor; closing connection".into(),
+            );
         }
     };
 
@@ -554,76 +705,50 @@ async fn check_compositor_commands(
     }
 }
 
-/// Build a quinn client config that skips server certificate verification.
-/// Used for short-lived peer `ServerInfo` probes (dev self-signed certs).
-fn build_peer_client_config() -> quinn::ClientConfig {
+/// Timeout for a single peer probe. Kept short so the compositor thread, which
+/// drives these synchronously during session placement, is never blocked for
+/// long by a slow or unreachable peer.
+const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Build a quinn client config for a peer probe that pins the peer's
+/// certificate (by configured fingerprint, or trust-on-first-use) instead of
+/// accepting any certificate. This prevents a man-in-the-middle from spoofing a
+/// peer's load or a token's home server during cluster placement.
+pub fn build_peer_client_config(policy: PinPolicy) -> quinn::ClientConfig {
+    let verifier = Arc::new(PinnedServerCertVerifier::new(policy));
     let provider = rustls::crypto::ring::default_provider();
     let crypto = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
         .expect("TLS protocol versions")
         .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(PeerSkipVerification))
+        .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .expect("QUIC client crypto config");
     quinn::ClientConfig::new(std::sync::Arc::new(crypto))
 }
 
-/// Certificate verifier for peer probes that accepts any server cert (dev).
-#[derive(Debug)]
-struct PeerSkipVerification;
-
-impl rustls::client::danger::ServerCertVerifier for PeerSkipVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 /// Query a peer server's load by opening a short-lived QUIC connection and
-/// exchanging `ServerInfoRequest`/`ServerInfo` on the control stream.
+/// exchanging `ServerInfoRequest`/`ServerInfo` on the control stream. The
+/// request carries the cluster shared secret (`auth`) and the peer's
+/// certificate is pinned via `policy`.
 ///
 /// Returns `None` on any error or timeout; callers treat that as "peer
 /// unavailable" and fall back to local placement.
-pub async fn query_peer_info(addr: SocketAddr) -> Option<ServerInfoMsg> {
-    let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+pub async fn query_peer_info(
+    addr: SocketAddr,
+    auth: &str,
+    policy: PinPolicy,
+) -> Option<ServerInfoMsg> {
+    let auth = auth.to_string();
+    let result = tokio::time::timeout(PEER_PROBE_TIMEOUT, async {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().ok()?).ok()?;
-        endpoint.set_default_client_config(build_peer_client_config());
+        endpoint.set_default_client_config(build_peer_client_config(policy));
 
         let connection = endpoint.connect(addr, "localhost").ok()?.await.ok()?;
         let (mut send, mut recv) = connection.open_bi().await.ok()?;
 
-        write_message(&mut send, &ControlMessage::ServerInfoRequest)
+        write_message(&mut send, &ControlMessage::ServerInfoRequest { auth })
             .await
             .ok()?;
 
@@ -646,25 +771,36 @@ pub async fn query_peer_info(addr: SocketAddr) -> Option<ServerInfoMsg> {
 
 /// Ask a peer server whether it hosts a resumable session for `token`, by
 /// opening a short-lived QUIC connection and exchanging
-/// `SessionLookupRequest`/`SessionLookupResponse` on the control stream.
+/// `SessionLookupRequest`/`SessionLookupResponse` on the control stream. The
+/// request carries the cluster shared secret (`auth`) and the peer's
+/// certificate is pinned via `policy`.
 ///
 /// Returns `Some(server_id)` when the peer confirms it hosts the session,
 /// `None` on a negative answer, error, or timeout. Used for cross-server
 /// session affinity: a server that receives a client for an unknown token
 /// probes its peers to find the session's home server before deciding whether
 /// to redirect the client there or create a new local session.
-pub async fn query_peer_for_token(addr: SocketAddr, token: &str) -> Option<String> {
+pub async fn query_peer_for_token(
+    addr: SocketAddr,
+    token: &str,
+    auth: &str,
+    policy: PinPolicy,
+) -> Option<String> {
     let token = token.to_string();
-    let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+    let auth = auth.to_string();
+    let result = tokio::time::timeout(PEER_PROBE_TIMEOUT, async {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().ok()?).ok()?;
-        endpoint.set_default_client_config(build_peer_client_config());
+        endpoint.set_default_client_config(build_peer_client_config(policy));
 
         let connection = endpoint.connect(addr, "localhost").ok()?.await.ok()?;
         let (mut send, mut recv) = connection.open_bi().await.ok()?;
 
-        write_message(&mut send, &ControlMessage::SessionLookupRequest { token })
-            .await
-            .ok()?;
+        write_message(
+            &mut send,
+            &ControlMessage::SessionLookupRequest { token, auth },
+        )
+        .await
+        .ok()?;
 
         let resp: ControlMessage = read_message(&mut recv).await.ok()?;
         match resp {
@@ -686,7 +822,7 @@ pub async fn query_peer_for_token(addr: SocketAddr, token: &str) -> Option<Strin
 /// Read a length-prefixed message from a QUIC receive stream.
 async fn read_message<T: serde::de::DeserializeOwned>(
     recv: &mut quinn::RecvStream,
-) -> Result<T, Box<dyn std::error::Error>> {
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
     // Read 4-byte length prefix.
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
@@ -704,7 +840,7 @@ async fn read_message<T: serde::de::DeserializeOwned>(
 async fn write_message<T: serde::Serialize>(
     send: &mut quinn::SendStream,
     msg: &T,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encoded = codec::encode(msg)?;
     send.write_all(&encoded).await?;
     Ok(())
@@ -731,6 +867,20 @@ mod tests {
             quinn::Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
         endpoint.set_default_client_config(client_config);
         endpoint
+    }
+
+    /// A throwaway trust-on-first-use pin policy for peer probes in tests, so we
+    /// never accept arbitrary certs and never touch the real known_hosts.
+    fn test_peer_policy(tag: &str) -> PinPolicy {
+        let path =
+            std::env::temp_dir().join(format!("wayray-srvtest-pins-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        PinPolicy::Tofu {
+            identity: format!("test-{tag}"),
+            store: Arc::new(Mutex::new(
+                wayray_protocol::tls::PinStore::open(path).unwrap(),
+            )),
+        }
     }
 
     /// Dummy certificate verifier that accepts any server cert.
@@ -776,7 +926,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_client_hello_exchange() {
-        let server_config = build_server_config();
+        let (server_config, _fp) = build_server_config();
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let actual_addr = endpoint.local_addr().unwrap();
@@ -851,7 +1001,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_display_and_input_streams() {
-        let server_config = build_server_config();
+        let (server_config, _fp) = build_server_config();
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let actual_addr = endpoint.local_addr().unwrap();
@@ -932,8 +1082,19 @@ mod tests {
 
     #[test]
     fn cert_generation_works() {
-        let (certs, _key) = generate_self_signed_cert();
+        let (certs, _key) = load_or_generate_cert();
         assert_eq!(certs.len(), 1);
+        assert!(wayray_protocol::tls::fingerprint(certs[0].as_ref()).starts_with("sha256:"));
+    }
+
+    #[test]
+    fn peer_auth_requires_matching_secret() {
+        // An empty configured secret authorizes nothing (secure default).
+        assert!(!peer_authenticated("", ""));
+        assert!(!peer_authenticated("", "anything"));
+        // A configured secret only matches itself.
+        assert!(peer_authenticated("s3cret", "s3cret"));
+        assert!(!peer_authenticated("s3cret", "wrong"));
     }
 
     #[tokio::test]
@@ -971,7 +1132,7 @@ mod tests {
     /// that `resumed` reflects the reply.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn handle_connection_uses_reply_binding() {
-        let server_config = build_server_config();
+        let (server_config, _fp) = build_server_config();
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let actual_addr = endpoint.local_addr().unwrap();
@@ -1008,15 +1169,17 @@ mod tests {
         let server_fut = async {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let _ = handle_connection(
-                &connection,
-                &cfg,
-                &comp_to_net_rx,
-                &net_to_comp_tx,
-                &active,
-                &tokens,
-            )
-            .await;
+            if let Ok(Some((control_send, control_recv, hello))) =
+                classify_connection(&connection, &cfg, &active, &tokens).await
+            {
+                let routed = RoutedClient {
+                    connection,
+                    control_send,
+                    control_recv,
+                    hello,
+                };
+                let _ = serve_client(routed, &cfg, &comp_to_net_rx, &net_to_comp_tx).await;
+            }
             let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
             endpoint.close(0u32.into(), b"done");
         };
@@ -1071,7 +1234,7 @@ mod tests {
     /// capacity. Exercised end-to-end through `query_peer_info`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn server_info_round_trips() {
-        let server_config = build_server_config();
+        let (server_config, _fp) = build_server_config();
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let actual_addr = endpoint.local_addr().unwrap();
@@ -1082,33 +1245,44 @@ mod tests {
         let cfg = ServerConfig {
             server_id: "b".to_string(),
             capacity: 50,
+            cluster_secret: "test-secret".to_string(),
             ..ServerConfig::default()
         };
         let active = Arc::new(AtomicU32::new(7));
         let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
+        // Two probes: an authenticated one (answered) and an unauthenticated
+        // one (refused — closing the load/oracle to non-peers).
+        let _comp_to_net_rx = comp_to_net_rx;
+        let _net_to_comp_tx = net_to_comp_tx;
 
         let server_fut = async {
-            let incoming = endpoint.accept().await.unwrap();
-            let connection = incoming.await.unwrap();
-            let _ = handle_connection(
-                &connection,
-                &cfg,
-                &comp_to_net_rx,
-                &net_to_comp_tx,
-                &active,
-                &tokens,
-            )
-            .await;
-            // Keep the connection alive until the client has finished reading
-            // the buffered ServerInfo, then let it close cleanly on drop.
-            connection.closed().await;
+            for _ in 0..2 {
+                let incoming = endpoint.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                let _ = classify_connection(&connection, &cfg, &active, &tokens).await;
+                // Keep the connection alive until the client has finished
+                // reading any buffered response, then close cleanly on drop.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    connection.closed(),
+                )
+                .await;
+            }
         };
 
         let client_fut = async {
-            let info = query_peer_info(actual_addr).await.expect("ServerInfo");
+            // Correct secret → answered.
+            let info = query_peer_info(actual_addr, "test-secret", test_peer_policy("info"))
+                .await
+                .expect("ServerInfo");
             assert_eq!(info.server_id, "b");
             assert_eq!(info.active_sessions, 7);
             assert_eq!(info.capacity, 50);
+
+            // Wrong secret → no answer (the server refuses to reply).
+            let refused =
+                query_peer_info(actual_addr, "wrong-secret", test_peer_policy("info2")).await;
+            assert!(refused.is_none());
         };
 
         tokio::join!(server_fut, client_fut);
@@ -1122,7 +1296,7 @@ mod tests {
     /// `note_remote_session`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn session_lookup_round_trips() {
-        let server_config = build_server_config();
+        let (server_config, _fp) = build_server_config();
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let actual_addr = endpoint.local_addr().unwrap();
@@ -1133,38 +1307,47 @@ mod tests {
         let cfg = ServerConfig {
             server_id: "a".to_string(),
             capacity: 50,
+            cluster_secret: "test-secret".to_string(),
             ..ServerConfig::default()
         };
         let active = Arc::new(AtomicU32::new(1));
         // Server `a` hosts a resumable session for "token-T".
         let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::from(["token-T".to_string()])));
+        let _comp_to_net_rx = comp_to_net_rx;
+        let _net_to_comp_tx = net_to_comp_tx;
 
-        // Two probes arrive on this connection-accepting server: one for a
-        // hosted token, one for an unknown token. Each probe is its own
-        // short-lived connection, so accept twice.
+        // Three probes: hosted token (authed), unknown token (authed), and a
+        // probe with the wrong secret (refused). Each is its own short-lived
+        // connection, so accept three times.
         let server_fut = async {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let incoming = endpoint.accept().await.unwrap();
                 let connection = incoming.await.unwrap();
-                let _ = handle_connection(
-                    &connection,
-                    &cfg,
-                    &comp_to_net_rx,
-                    &net_to_comp_tx,
-                    &active,
-                    &tokens,
+                let _ = classify_connection(&connection, &cfg, &active, &tokens).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    connection.closed(),
                 )
                 .await;
-                connection.closed().await;
             }
         };
 
         let client_fut = async {
-            let hit = query_peer_for_token(actual_addr, "token-T").await;
+            let hit =
+                query_peer_for_token(actual_addr, "token-T", "test-secret", test_peer_policy("h"))
+                    .await;
             assert_eq!(hit.as_deref(), Some("a"));
 
-            let miss = query_peer_for_token(actual_addr, "nope").await;
+            let miss =
+                query_peer_for_token(actual_addr, "nope", "test-secret", test_peer_policy("m"))
+                    .await;
             assert_eq!(miss, None);
+
+            // Wrong secret → the oracle is closed, so no answer.
+            let refused =
+                query_peer_for_token(actual_addr, "token-T", "bad-secret", test_peer_policy("r"))
+                    .await;
+            assert_eq!(refused, None);
         };
 
         tokio::join!(server_fut, client_fut);
@@ -1174,7 +1357,7 @@ mod tests {
     /// receives a `SessionRedirect` carrying the expected target id and addr.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn redirect_decision_sends_session_redirect() {
-        let server_config = build_server_config();
+        let (server_config, _fp) = build_server_config();
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let actual_addr = endpoint.local_addr().unwrap();
@@ -1205,19 +1388,24 @@ mod tests {
         let server_fut = async {
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let _ = handle_connection(
-                &connection,
-                &cfg,
-                &comp_to_net_rx,
-                &net_to_comp_tx,
-                &active,
-                &tokens,
-            )
-            .await;
-            let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
-            // Keep the connection alive until the client reads the buffered
-            // SessionRedirect, then close on drop.
-            connection.closed().await;
+            if let Ok(Some((control_send, control_recv, hello))) =
+                classify_connection(&connection, &cfg, &active, &tokens).await
+            {
+                // Serve takes ownership of the connection; keep a handle to it
+                // for the post-serve close by cloning before moving.
+                let conn_for_close = connection.clone();
+                let routed = RoutedClient {
+                    connection,
+                    control_send,
+                    control_recv,
+                    hello,
+                };
+                let _ = serve_client(routed, &cfg, &comp_to_net_rx, &net_to_comp_tx).await;
+                let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
+                // Keep the connection alive until the client reads the buffered
+                // SessionRedirect, then close on drop.
+                conn_for_close.closed().await;
+            }
         };
 
         let client_fut = async {

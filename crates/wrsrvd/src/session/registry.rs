@@ -104,7 +104,8 @@ impl SessionRegistry {
         self.token_index.insert(token.clone(), id);
         self.sessions.insert(id, session);
 
-        info!(%id, %token, home_server = %self.local_server_id, "session created");
+        // The token is a session credential; log only the id and home server.
+        info!(%id, home_server = %self.local_server_id, "session created");
         id
     }
 

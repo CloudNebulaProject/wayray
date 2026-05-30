@@ -1,7 +1,8 @@
 //! wrsessd -- WayRay session launcher daemon.
 //!
-//! Reference implementation of the session launcher interface. Listens on
-//! a Unix socket for events from the WayRay compositor:
+//! Reference implementation of the session launcher interface. Serves launcher
+//! requests from the WayRay compositor over the shared transport (a Unix socket
+//! everywhere, or illumos doors when built with `--features doors`):
 //!
 //! - `session_requested`: Start a greeter for the new session
 //! - `session_authenticated`: Launch the user's desktop from session.toml
@@ -12,15 +13,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
 
 use miette::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
-use tokio::process::{Child, Command};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use wayray_protocol::launcher::{LauncherRequest, LauncherResponse, SessionInfo};
 use wayray_protocol::session_config::SessionConfig;
+use wayray_protocol::transport::RequestHandler;
 
 /// Tracked state for an active session.
 struct ManagedSession {
@@ -48,7 +47,7 @@ impl Launcher {
     }
 
     /// Handle a session_requested event: launch the greeter.
-    async fn handle_session_requested(
+    fn handle_session_requested(
         &mut self,
         token: String,
         wayland_display: String,
@@ -88,11 +87,7 @@ impl Launcher {
     }
 
     /// Handle session_authenticated: launch the user's desktop.
-    async fn handle_session_authenticated(
-        &mut self,
-        token: String,
-        user: String,
-    ) -> LauncherResponse {
+    fn handle_session_authenticated(&mut self, token: String, user: String) -> LauncherResponse {
         let Some(session) = self.sessions.get_mut(&token) else {
             return LauncherResponse::Error {
                 token,
@@ -129,11 +124,11 @@ impl Launcher {
     }
 
     /// Handle session_logout: kill all child processes.
-    async fn handle_session_logout(&mut self, token: String, _session_id: u64) {
+    fn handle_session_logout(&mut self, token: String, _session_id: u64) {
         if let Some(mut session) = self.sessions.remove(&token) {
             info!(%token, "session logout, cleaning up");
             for child in &mut session.children {
-                let _ = child.kill().await;
+                let _ = child.kill();
             }
         }
     }
@@ -153,11 +148,11 @@ impl Launcher {
     }
 
     /// Admin: kill a session by token.
-    async fn kill_session(&mut self, token: String) -> LauncherResponse {
+    fn kill_session(&mut self, token: String) -> LauncherResponse {
         if let Some(mut session) = self.sessions.remove(&token) {
             info!(%token, "admin: killing session");
             for child in &mut session.children {
-                let _ = child.kill().await;
+                let _ = child.kill();
             }
             LauncherResponse::SessionKilled { token }
         } else {
@@ -169,13 +164,32 @@ impl Launcher {
     }
 }
 
+impl RequestHandler for Launcher {
+    fn handle(&mut self, request: LauncherRequest) -> Option<LauncherResponse> {
+        match request {
+            LauncherRequest::SessionRequested {
+                token,
+                wayland_display,
+            } => Some(self.handle_session_requested(token, wayland_display)),
+            LauncherRequest::SessionAuthenticated { token, user } => {
+                Some(self.handle_session_authenticated(token, user))
+            }
+            LauncherRequest::SessionLogout { token, session_id } => {
+                self.handle_session_logout(token, session_id);
+                None // logout has no response
+            }
+            LauncherRequest::ListSessions => Some(self.list_sessions()),
+            LauncherRequest::KillSession { token } => Some(self.kill_session(token)),
+        }
+    }
+}
+
 /// Default IPC path for the launcher (uses shared transport default).
 fn default_socket_path() -> PathBuf {
     wayray_protocol::transport::default_ipc_path()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -188,78 +202,18 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
 
-    // Remove stale socket file if it exists.
-    let _ = std::fs::remove_file(&socket_path);
+    info!(endpoint = %socket_path.display(), "wrsessd listening");
 
-    let listener = UnixListener::bind(&socket_path).map_err(|e| {
+    let launcher = Launcher::new();
+
+    // serve() selects the doors transport on illumos (with `--features doors`)
+    // and a Unix socket everywhere else — the same transport the client half
+    // (`send_request_sync`) selects, so the two always match.
+    wayray_protocol::transport::serve(&socket_path, Box::new(launcher)).map_err(|e| {
         miette::miette!(
-            "failed to bind launcher socket at {}: {}",
+            "failed to serve launcher at {}: {}",
             socket_path.display(),
             e
         )
-    })?;
-
-    info!(socket = %socket_path.display(), "wrsessd listening");
-
-    let mut launcher = Launcher::new();
-
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|e| miette::miette!("failed to accept connection: {}", e))?;
-
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-
-        // Read JSON lines from the client (wrsrvd).
-        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                line.clear();
-                continue;
-            }
-
-            match serde_json::from_str::<LauncherRequest>(trimmed) {
-                Ok(request) => {
-                    let response = match request {
-                        LauncherRequest::SessionRequested {
-                            token,
-                            wayland_display,
-                        } => {
-                            launcher
-                                .handle_session_requested(token, wayland_display)
-                                .await
-                        }
-                        LauncherRequest::SessionAuthenticated { token, user } => {
-                            launcher.handle_session_authenticated(token, user).await
-                        }
-                        LauncherRequest::SessionLogout { token, session_id } => {
-                            launcher.handle_session_logout(token, session_id).await;
-                            // No response for logout.
-                            line.clear();
-                            continue;
-                        }
-                        LauncherRequest::ListSessions => launcher.list_sessions(),
-                        LauncherRequest::KillSession { token } => {
-                            launcher.kill_session(token).await
-                        }
-                    };
-
-                    let mut resp_json = serde_json::to_string(&response).unwrap();
-                    resp_json.push('\n');
-                    if let Err(e) = writer.write_all(resp_json.as_bytes()).await {
-                        warn!(error = %e, "failed to send response");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, line = trimmed, "failed to parse launcher request");
-                }
-            }
-
-            line.clear();
-        }
-    }
+    })
 }

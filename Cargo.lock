@@ -2471,16 +2471,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "signal-hook-registry"
-version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
-dependencies = [
- "errno",
- "libc",
-]
-
-[[package]]
 name = "simd_cesu8"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2869,11 +2859,9 @@ version = "1.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bd1c4c0fc4a7ab90fc15ef6daaa3ec3b893f004f915f2392557ed23237820cd"
 dependencies = [
- "bytes",
  "libc",
  "mio",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -3371,8 +3359,10 @@ version = "0.1.0"
 dependencies = [
  "doors",
  "postcard",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "toml",
  "tracing",
@@ -3974,9 +3964,6 @@ name = "wrsessd"
 version = "0.1.0"
 dependencies = [
  "miette",
- "serde",
- "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "wayray-protocol",
@@ -3987,6 +3974,7 @@ name = "wrsrvd"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "getrandom 0.3.4",
  "miette",
  "quinn",
  "rcgen",

@@ -110,18 +110,28 @@ pub enum ControlMessage {
     Pong(Pong),
     FrameAck(FrameAck),
     SessionEvent(SessionEvent),
-    /// Lightweight server-info request (empty payload) used by a peer/client
-    /// to probe load before placing a new session.
-    ServerInfoRequest,
+    /// Lightweight server-info request used by a peer to probe load before
+    /// placing a new session. Carries the cluster shared secret so the server
+    /// only answers authenticated peers (not arbitrary network clients).
+    ServerInfoRequest {
+        /// Cluster shared secret authenticating the probing peer.
+        auth: String,
+    },
     /// Response to a `ServerInfoRequest`.
     ServerInfo(ServerInfoMsg),
     /// Cross-server affinity probe: a peer asks whether this server hosts a
     /// resumable session for `token`. Used so a server that receives a client
     /// for an unknown token can discover the session's home server and redirect
     /// the client there instead of creating a duplicate.
+    ///
+    /// Carries the cluster shared secret: answering this for an arbitrary caller
+    /// would turn the control channel into a token-existence oracle, so only
+    /// authenticated peers are answered.
     SessionLookupRequest {
         /// Session token to look up.
         token: String,
+        /// Cluster shared secret authenticating the probing peer.
+        auth: String,
     },
     /// Response to a `SessionLookupRequest`.
     SessionLookupResponse(SessionLookupResponse),
