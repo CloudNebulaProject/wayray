@@ -664,6 +664,11 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWorkspaceV1, (), D> for WmProtocolSt
                     warn!("set_window_tags for unknown window resource");
                 }
             }
+            wayray_wm_workspace_v1::Request::SetActiveTags { output_name, tags } => {
+                info!(output = %output_name, tags, "WM set active tags");
+                // No event defined in the XML; visibility is recomputed next frame.
+                proto.workspace.set_active_tags(output_name, tags);
+            }
             wayray_wm_workspace_v1::Request::Destroy => {
                 // Keep workspace data so a reconnecting WM can resync; just
                 // drop the resource handle.

@@ -162,7 +162,9 @@ impl WorkspaceState {
         self.workspaces.remove(name);
         self.window_workspace.retain(|_, ws| ws != name);
 
-        let fallback = self.workspaces.keys().next().cloned();
+        // Deterministic fallback: pick the lexicographically-first remaining
+        // workspace rather than relying on HashMap iteration order.
+        let fallback = self.workspaces.keys().min().cloned();
         let affected: Vec<String> = self
             .active
             .iter()
@@ -184,6 +186,14 @@ impl WorkspaceState {
     /// Set the active workspace on an output.
     pub fn set_active_workspace(&mut self, output_name: String, workspace_name: String) {
         self.active.insert(output_name, workspace_name);
+    }
+
+    /// Set the active (visible) tag bitmask on an output. The counterpart to
+    /// [`set_window_tags`](Self::set_window_tags): a tag-mode window is visible
+    /// when any of its tags intersects this mask. Without this, the active tag
+    /// set was stuck at its default and tag-mode windows could never switch.
+    pub fn set_active_tags(&mut self, output_name: String, tags: u32) {
+        self.active_tags.insert(output_name, tags);
     }
 
     /// Assign a window to a workspace (exclusive mode). Clears any tag bitmask
@@ -272,6 +282,28 @@ mod tests {
         // Activate both bits -> still visible (any-match).
         ws.active_tags.insert(DEFAULT_OUTPUT.to_string(), 0b11);
         assert!(ws.is_visible(wid(1), DEFAULT_OUTPUT));
+    }
+
+    #[test]
+    fn set_active_tags_switches_visible_window() {
+        let mut ws = WorkspaceState::default();
+        // win1 on tag bit 0, win2 on tag bit 1.
+        ws.set_window_tags(wid(1), 0b01);
+        ws.set_window_tags(wid(2), 0b10);
+
+        // Default active tags = 0x1 -> only win1 visible.
+        assert!(ws.is_visible(wid(1), DEFAULT_OUTPUT));
+        assert!(!ws.is_visible(wid(2), DEFAULT_OUTPUT));
+
+        // Switch active tags to bit 1 -> only win2 visible.
+        ws.set_active_tags(DEFAULT_OUTPUT.to_string(), 0b10);
+        assert!(!ws.is_visible(wid(1), DEFAULT_OUTPUT));
+        assert!(ws.is_visible(wid(2), DEFAULT_OUTPUT));
+
+        // Show both tags -> both visible.
+        ws.set_active_tags(DEFAULT_OUTPUT.to_string(), 0b11);
+        assert!(ws.is_visible(wid(1), DEFAULT_OUTPUT));
+        assert!(ws.is_visible(wid(2), DEFAULT_OUTPUT));
     }
 
     #[test]

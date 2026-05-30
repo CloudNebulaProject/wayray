@@ -1,9 +1,25 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use super::types::{Session, SessionId, SessionState, SessionToken, SessionTransitionError};
 use wayray_protocol::cluster::DEFAULT_CAPACITY;
+
+/// How long a cached "this token lives on server X" affinity entry is trusted
+/// before it must be re-confirmed by a fresh peer probe. Without expiry a stale
+/// entry (the session moved or died) would redirect a reconnecting client to a
+/// server that no longer hosts it — looping until the redirect limit drops the
+/// session.
+const REMOTE_SESSION_TTL: Duration = Duration::from_secs(30);
+
+/// A cached remote-session affinity record: which server hosts the token, and
+/// when we learned it (for TTL expiry).
+#[derive(Debug, Clone)]
+struct RemoteEntry {
+    server_id: String,
+    noted_at: Instant,
+}
 
 /// Where a session bound to a token currently lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +48,9 @@ pub struct SessionRegistry {
     next_id: u64,
     /// This server's id within the cluster (empty for single-server mode).
     local_server_id: String,
-    /// Tokens known to live on a remote server: token → server id.
-    remote_sessions: HashMap<SessionToken, String>,
+    /// Tokens known to live on a remote server, with the time the affinity was
+    /// learned (entries past [`REMOTE_SESSION_TTL`] are treated as unknown).
+    remote_sessions: HashMap<SessionToken, RemoteEntry>,
     /// Maximum number of sessions this server will host (for load factor).
     capacity: u32,
 }
@@ -70,20 +87,38 @@ impl SessionRegistry {
     }
 
     /// Mark a token as living on a remote server (from cluster config or a
-    /// peer query). Used so a reconnecting client can be redirected home.
+    /// peer query). Used so a reconnecting client can be redirected home. The
+    /// entry is timestamped and expires after [`REMOTE_SESSION_TTL`].
     pub fn note_remote_session(&mut self, token: SessionToken, server_id: impl Into<String>) {
-        self.remote_sessions.insert(token, server_id.into());
+        self.remote_sessions.insert(
+            token,
+            RemoteEntry {
+                server_id: server_id.into(),
+                noted_at: Instant::now(),
+            },
+        );
     }
 
-    /// Determine where the session bound to `token` lives.
+    /// Determine where the session bound to `token` lives. A remote affinity
+    /// entry older than [`REMOTE_SESSION_TTL`] is treated as `Unknown` so the
+    /// caller re-probes peers instead of redirecting on stale information.
     pub fn locate(&self, token: &SessionToken) -> SessionLocation {
         if let Some(id) = self.token_index.get(token) {
             return SessionLocation::Local(*id);
         }
-        if let Some(server_id) = self.remote_sessions.get(token) {
-            return SessionLocation::Remote(server_id.clone());
+        if let Some(entry) = self.remote_sessions.get(token)
+            && entry.noted_at.elapsed() < REMOTE_SESSION_TTL
+        {
+            return SessionLocation::Remote(entry.server_id.clone());
         }
         SessionLocation::Unknown
+    }
+
+    /// Drop remote-affinity entries that have passed [`REMOTE_SESSION_TTL`].
+    /// Called periodically alongside session cleanup.
+    pub fn prune_remote_sessions(&mut self) {
+        self.remote_sessions
+            .retain(|_, e| e.noted_at.elapsed() < REMOTE_SESSION_TTL);
     }
 
     /// Current load factor: active sessions / capacity, clamped to [0, 1+].
@@ -374,6 +409,28 @@ mod tests {
             reg.locate(&SessionToken::new("nope")),
             SessionLocation::Unknown
         );
+    }
+
+    #[test]
+    fn remote_affinity_expires_and_prunes() {
+        let mut reg = SessionRegistry::with_cluster("server-a", 50);
+        let token = SessionToken::new("remote-tok");
+        reg.note_remote_session(token.clone(), "server-b");
+        assert_eq!(
+            reg.locate(&token),
+            SessionLocation::Remote("server-b".to_string())
+        );
+
+        // Age the entry past the TTL (skip if the monotonic clock can't go back
+        // far enough, e.g. very early in process life).
+        if let Some(old) = Instant::now().checked_sub(REMOTE_SESSION_TTL + Duration::from_secs(1)) {
+            reg.remote_sessions.get_mut(&token).unwrap().noted_at = old;
+            // Stale affinity is reported as Unknown so the caller re-probes.
+            assert_eq!(reg.locate(&token), SessionLocation::Unknown);
+            // Pruning removes the dead entry.
+            reg.prune_remote_sessions();
+            assert!(reg.remote_sessions.is_empty());
+        }
     }
 
     #[test]

@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Primary gate: format, lint, test, and build the full workspace on Linux.
+  linux:
+    name: Linux (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # Headless core uses the pixman renderer; wrclient uses winit + wgpu;
+          # both need the Wayland / xkbcommon / pixman development headers.
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libpixman-1-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build (release)
+        run: cargo build --workspace --release --locked
+
+  # illumos is the primary target. This job compiles and tests on OmniOS,
+  # crucially exercising the `doors` IPC code path (the doors crate only builds
+  # on illumos, so it is invisible to the Linux job above).
+  illumos:
+    name: illumos (OmniOS) — incl. doors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & test in an OmniOS VM
+        uses: vmactions/omnios-vm@v1
+        with:
+          usesh: true
+          # OmniOS ships rustup via the extra (ooce) publisher; fall back to the
+          # upstream rustup installer for the x86_64-unknown-illumos target.
+          prepare: |
+            pkg install -v --accept developer/gcc14 ooce/developer/rust || true
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal || true
+          run: |
+            export PATH="$HOME/.cargo/bin:/opt/ooce/bin:$PATH"
+            rustc --version || true
+            cargo --version
+            # Build the portable core and run its tests.
+            cargo test -p wayray-protocol --locked
+            # Compile the doors IPC code path (client + server) — the whole point
+            # of this job: it never compiles on Linux.
+            cargo check -p wayray-protocol --features doors --locked
+            cargo check -p wrsessd --features doors --locked

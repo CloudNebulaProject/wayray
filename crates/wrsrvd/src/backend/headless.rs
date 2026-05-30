@@ -247,6 +247,9 @@ pub fn run(
             if !expired.is_empty() {
                 calloop_data.session_registry.purge_destroyed();
             }
+            // Drop stale cross-server affinity entries so we re-probe rather
+            // than redirect on outdated information.
+            calloop_data.session_registry.prune_remote_sessions();
         }
 
         // Dispatch Wayland clients.

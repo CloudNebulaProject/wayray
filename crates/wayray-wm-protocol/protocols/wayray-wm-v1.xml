@@ -392,7 +392,18 @@
         Window is visible when any tag matches the output's active tags.
       </description>
       <arg name="window" type="object" interface="wayray_wm_window_v1"/>
-      <arg name="tags" type="uint" summary="bitmask of active tags"/>
+      <arg name="tags" type="uint" summary="bitmask of the window's tags"/>
+    </request>
+
+    <request name="set_active_tags">
+      <description summary="set the visible tag bitmask on an output (dwm-style)">
+        Selects which tags are shown on an output. A window in tag mode is
+        visible when any of its tags intersects this bitmask. This is the
+        counterpart to set_window_tags: without it the active tag set could
+        never change, so tag-mode windows could never be switched.
+      </description>
+      <arg name="output_name" type="string"/>
+      <arg name="tags" type="uint" summary="bitmask of active tags on the output"/>
     </request>
 
     <request name="destroy" type="destructor">
