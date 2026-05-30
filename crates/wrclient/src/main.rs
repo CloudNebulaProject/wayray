@@ -196,6 +196,92 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Initial reconnect backoff in milliseconds. Kept tight so loopback/LAN
+/// reconnects land well under the 500ms hot-desk target.
+const INITIAL_BACKOFF_MS: u64 = 50;
+
+/// Maximum reconnect backoff in milliseconds (exponential cap).
+const MAX_BACKOFF_MS: u64 = 2000;
+
+/// Why the per-connection session loop ended.
+enum SessionEnd {
+    /// The local render thread closed; the client should shut down.
+    RenderThreadClosed,
+    /// The server connection dropped; the client should reconnect.
+    Disconnected,
+}
+
+/// Run one connection's frame-receive / input-forward loop until the stream
+/// errors (returns [`SessionEnd::Disconnected`]) or the render thread closes
+/// (returns [`SessionEnd::RenderThreadClosed`]).
+async fn run_session_loop(
+    conn: &mut network::ServerConnection,
+    display_recv: &mut quinn::RecvStream,
+    framebuffer: &mut [u8],
+    stride: usize,
+    input_rx: &mpsc::Receiver<InputMessage>,
+    frame_tx: &mpsc::Sender<FrameData>,
+    proxy: &EventLoopProxy<()>,
+) -> SessionEnd {
+    loop {
+        // Drain any pending input messages before blocking on frame read.
+        while let Ok(input_msg) = input_rx.try_recv() {
+            if let Err(e) = conn.send_input(&input_msg).await {
+                warn!(error = %e, "failed to send input, reconnecting");
+                return SessionEnd::Disconnected;
+            }
+        }
+
+        // Use a short timeout so we can keep draining input even when no
+        // frames are arriving.
+        let frame_result = tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            network::read_display_message(display_recv),
+        )
+        .await;
+
+        match frame_result {
+            Ok(Ok(wayray_protocol::messages::DisplayMessage::FrameUpdate(update))) => {
+                info!(
+                    sequence = update.sequence,
+                    regions = update.regions.len(),
+                    "received frame"
+                );
+
+                // Apply damage regions to the persistent framebuffer.
+                for region in &update.regions {
+                    wayray_protocol::encoding::apply_region(framebuffer, stride, region);
+                }
+
+                if frame_tx
+                    .send(FrameData {
+                        pixels: framebuffer.to_vec(),
+                    })
+                    .is_err()
+                {
+                    return SessionEnd::RenderThreadClosed;
+                }
+
+                // Wake the winit event loop to process the new frame.
+                let _ = proxy.send_event(());
+
+                // Acknowledge the frame.
+                if let Err(e) = conn.send_frame_ack(update.sequence).await {
+                    warn!(error = %e, "failed to send frame ack, reconnecting");
+                    return SessionEnd::Disconnected;
+                }
+            }
+            Ok(Err(e)) => {
+                error!(error = %e, "display stream error");
+                return SessionEnd::Disconnected;
+            }
+            Err(_) => {
+                // Timeout -- no frame available, loop back to drain input.
+            }
+        }
+    }
+}
+
 /// Load or generate a persistent session token.
 ///
 /// Reads from `~/.config/wayray/token`. If the file doesn't exist,
@@ -303,102 +389,125 @@ fn main() {
                     token,
                 };
 
-                let (_endpoint, mut conn) = match network::connect(&config).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(error = %e, "failed to connect to server");
-                        // Send zero dimensions to unblock the main thread.
-                        let _ = dim_tx.send((0, 0));
-                        return;
-                    }
-                };
+                // Reconnect loop: on any disconnection we immediately retry with
+                // the SAME token so the server resumes the existing session
+                // (hot-desking). Backoff starts tight to hit the <500ms target.
+                let mut backoff = std::time::Duration::from_millis(INITIAL_BACKOFF_MS);
+                let mut dims_reported = false;
+                let mut first_attempt = true;
 
-                let width = conn.server_hello.output_width;
-                let height = conn.server_hello.output_height;
-                info!(
-                    width,
-                    height,
-                    session_id = conn.server_hello.session_id,
-                    "connected to server"
-                );
-
-                // Send dimensions to the main thread so it can create the window.
-                if dim_tx.send((width, height)).is_err() {
-                    error!("main thread not listening for dimensions");
-                    return;
-                }
-
-                // Accept the display stream from the server.
-                let mut display_recv = match conn.accept_display_stream().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(error = %e, "failed to accept display stream");
-                        return;
-                    }
-                };
-
-                // Maintain a persistent framebuffer for XOR-diff decoding.
-                let stride = width as usize * 4;
-                let mut framebuffer = vec![0u8; stride * height as usize];
-
-                // Read frames and forward input in a select loop.
                 loop {
-                    // Drain any pending input messages before blocking on frame read.
-                    while let Ok(input_msg) = input_rx.try_recv() {
-                        if let Err(e) = conn.send_input(&input_msg).await {
-                            warn!(error = %e, "failed to send input");
+                    // Time from the start of a reconnect attempt to ServerHello.
+                    let attempt_start = std::time::Instant::now();
+                    let connect_result = network::connect(&config).await;
+
+                    let (_endpoint, mut conn) = match connect_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            if first_attempt {
+                                error!(error = %e, "failed to connect to server");
+                                // Unblock the main thread on the very first try.
+                                let _ = dim_tx.send((0, 0));
+                                return;
+                            }
+                            warn!(error = %e, backoff_ms = backoff.as_millis() as u64,
+                                "reconnect failed, retrying");
+                            tokio::time::sleep(backoff).await;
+                            backoff =
+                                (backoff * 2).min(std::time::Duration::from_millis(MAX_BACKOFF_MS));
+                            continue;
+                        }
+                    };
+
+                    first_attempt = false;
+                    // Successful connection resets the backoff.
+                    backoff = std::time::Duration::from_millis(INITIAL_BACKOFF_MS);
+
+                    let width = conn.server_hello.output_width;
+                    let height = conn.server_hello.output_height;
+                    let resumed = conn.server_hello.resumed;
+                    info!(
+                        width,
+                        height,
+                        session_id = conn.server_hello.session_id,
+                        resumed,
+                        reconnect_ms = attempt_start.elapsed().as_millis() as u64,
+                        "connected to server"
+                    );
+
+                    // On a resumed session the server sends a Resumed event on
+                    // the control stream right after ServerHello. Consume it so
+                    // the stream stays drained and we can log the confirmation.
+                    // The framebuffer is reallocated fresh below regardless, so
+                    // the resume already triggers a clean full redraw.
+                    if resumed {
+                        match conn.recv_control().await {
+                            Ok(wayray_protocol::messages::ControlMessage::SessionEvent(
+                                wayray_protocol::messages::SessionEvent::Resumed { session_id },
+                            )) => {
+                                info!(session_id, "session resume confirmed by server");
+                            }
+                            Ok(other) => {
+                                warn!(
+                                    ?other,
+                                    "unexpected control message after resumed ServerHello"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to read Resumed event, reconnecting");
+                                continue;
+                            }
                         }
                     }
 
-                    // Use a short timeout so we can keep draining input even
-                    // when no frames are arriving.
-                    let frame_result = tokio::time::timeout(
-                        std::time::Duration::from_millis(5),
-                        network::read_display_message(&mut display_recv),
+                    // Report dimensions to the main thread once (window is
+                    // created from these); on resume they are unchanged.
+                    if !dims_reported {
+                        if dim_tx.send((width, height)).is_err() {
+                            error!("main thread not listening for dimensions");
+                            return;
+                        }
+                        dims_reported = true;
+                    }
+
+                    // Accept the display stream from the server.
+                    let mut display_recv = match conn.accept_display_stream().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error = %e, "failed to accept display stream, reconnecting");
+                            continue;
+                        }
+                    };
+
+                    // Maintain a persistent framebuffer for XOR-diff decoding.
+                    // A fresh buffer per (re)connection forces a clean redraw,
+                    // matching the server's full-frame send after a resume.
+                    let stride = width as usize * 4;
+                    let mut framebuffer = vec![0u8; stride * height as usize];
+
+                    // Read frames and forward input in a select loop. On any
+                    // stream error we break out to the reconnect loop instead
+                    // of exiting the client.
+                    let disconnected = run_session_loop(
+                        &mut conn,
+                        &mut display_recv,
+                        &mut framebuffer,
+                        stride,
+                        &input_rx,
+                        &frame_tx,
+                        &proxy,
                     )
                     .await;
 
-                    match frame_result {
-                        Ok(Ok(wayray_protocol::messages::DisplayMessage::FrameUpdate(update))) => {
-                            info!(
-                                sequence = update.sequence,
-                                regions = update.regions.len(),
-                                "received frame"
-                            );
-
-                            // Apply damage regions to the persistent framebuffer.
-                            for region in &update.regions {
-                                wayray_protocol::encoding::apply_region(
-                                    &mut framebuffer,
-                                    stride,
-                                    region,
-                                );
-                            }
-
-                            if frame_tx
-                                .send(FrameData {
-                                    pixels: framebuffer.clone(),
-                                })
-                                .is_err()
-                            {
-                                info!("render thread closed, stopping network loop");
-                                break;
-                            }
-
-                            // Wake the winit event loop to process the new frame.
-                            let _ = proxy.send_event(());
-
-                            // Acknowledge the frame.
-                            if let Err(e) = conn.send_frame_ack(update.sequence).await {
-                                warn!(error = %e, "failed to send frame ack");
-                            }
+                    match disconnected {
+                        SessionEnd::RenderThreadClosed => {
+                            info!("render thread closed, stopping network loop");
+                            return;
                         }
-                        Ok(Err(e)) => {
-                            error!(error = %e, "display stream error");
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout -- no frame available, loop back to drain input.
+                        SessionEnd::Disconnected => {
+                            warn!("server connection lost, reconnecting with same token");
+                            // Tight retry to hit the sub-500ms reconnect target.
+                            tokio::time::sleep(backoff).await;
                         }
                     }
                 }

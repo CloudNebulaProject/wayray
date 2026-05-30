@@ -27,6 +27,7 @@ use tracing::{error, info, warn};
 use wayray_protocol::codec;
 use wayray_protocol::messages::{
     ClientHello, ControlMessage, DisplayMessage, FrameUpdate, InputMessage, ServerHello,
+    SessionEvent,
 };
 
 /// Messages sent from the compositor to the network thread.
@@ -37,14 +38,31 @@ pub enum CompositorToNet {
     Shutdown,
 }
 
+/// Resolved session binding returned by the compositor in response to a
+/// `ClientConnected` event. Carries the real session id and resume flag so
+/// the network thread can compose an accurate `ServerHello`.
+pub struct SessionBinding {
+    /// The session id assigned/resolved by the session registry.
+    pub session_id: u64,
+    /// Whether this connection resumed an existing session (hot-desking).
+    pub resumed: bool,
+    /// The token bound to the session (echoed back to the client).
+    pub token: String,
+}
+
 /// Messages sent from the network thread to the compositor.
 pub enum NetToCompositor {
     /// An input event received from the client.
     Input(InputMessage),
     /// A control message (e.g., FrameAck) from the client.
     Control(ControlMessage),
-    /// Client connected with the given hello.
-    ClientConnected(ClientHello),
+    /// Client connected with the given hello. The compositor resolves the
+    /// session via the registry and replies with a `SessionBinding` so the
+    /// network thread can fill in the real session id / resumed flag.
+    ClientConnected {
+        hello: ClientHello,
+        reply: mpsc::Sender<SessionBinding>,
+    },
     /// Client disconnected.
     ClientDisconnected,
 }
@@ -211,6 +229,28 @@ async fn server_loop(
     Ok(())
 }
 
+/// Await a `SessionBinding` reply from the compositor, polling the blocking
+/// `std::sync::mpsc` channel from this async context with a short interval and
+/// a hard deadline. Returns `None` on timeout or if the sender is dropped.
+async fn recv_binding_with_timeout(
+    rx: mpsc::Receiver<SessionBinding>,
+    timeout: std::time::Duration,
+) -> Option<SessionBinding> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match rx.try_recv() {
+            Ok(binding) => return Some(binding),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    }
+}
+
 /// Poll for shutdown on a blocking channel from an async context.
 async fn check_shutdown_async(rx: &mpsc::Receiver<CompositorToNet>) {
     loop {
@@ -253,18 +293,55 @@ async fn handle_connection(
         return Err(format!("expected ClientHello, got {client_hello:?}").into());
     };
     info!(version = hello.version, "received ClientHello");
-    let token = hello.token.clone().unwrap_or_default();
-    let _ = compositor_tx.send(NetToCompositor::ClientConnected(hello));
+    let fallback_token = hello.token.clone().unwrap_or_default();
+
+    // Round-trip to the compositor: it resolves the session via the registry
+    // and replies with the real session id / resumed flag. We bound the wait
+    // so a stalled compositor cannot wedge the handshake; on timeout we fall
+    // back to a best-effort ServerHello.
+    let (reply_tx, reply_rx) = mpsc::channel::<SessionBinding>();
+    let connect_start = std::time::Instant::now();
+    let _ = compositor_tx.send(NetToCompositor::ClientConnected {
+        hello,
+        reply: reply_tx,
+    });
+
+    let binding = recv_binding_with_timeout(reply_rx, std::time::Duration::from_millis(250)).await;
+    let (session_id, resumed, token) = match binding {
+        Some(b) => {
+            info!(
+                session_id = b.session_id,
+                resumed = b.resumed,
+                elapsed_ms = connect_start.elapsed().as_millis() as u64,
+                "session binding resolved"
+            );
+            (b.session_id, b.resumed, b.token)
+        }
+        None => {
+            warn!("timed out waiting for session binding; using fallback ServerHello");
+            (0, false, fallback_token)
+        }
+    };
+
     let server_hello = ControlMessage::ServerHello(ServerHello {
         version: wayray_protocol::PROTOCOL_VERSION,
-        session_id: 1, // Assigned by session registry in task 3
+        session_id,
         output_width: config.output_width,
         output_height: config.output_height,
-        resumed: false,
+        resumed,
         token,
     });
     write_message(&mut control_send, &server_hello).await?;
     info!("sent ServerHello");
+
+    // On a resumed (hot-desked) session, tell the client to drop any frame
+    // cache and expect a full redraw.
+    if resumed {
+        let resumed_event = ControlMessage::SessionEvent(SessionEvent::Resumed { session_id });
+        if let Err(e) = write_message(&mut control_send, &resumed_event).await {
+            warn!(error = %e, "failed to send Resumed event");
+        }
+    }
 
     // Step 3: Open display uni stream. Writing data triggers the client's
     // accept_uni for this stream.
@@ -609,5 +686,120 @@ mod tests {
     fn cert_generation_works() {
         let (certs, _key) = generate_self_signed_cert();
         assert_eq!(certs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn binding_timeout_returns_none() {
+        // No sender ever sends; should time out quickly and return None.
+        let (_tx, rx) = mpsc::channel::<SessionBinding>();
+        let binding = recv_binding_with_timeout(rx, std::time::Duration::from_millis(20)).await;
+        assert!(binding.is_none());
+    }
+
+    #[tokio::test]
+    async fn binding_received_before_timeout() {
+        let (tx, rx) = mpsc::channel::<SessionBinding>();
+        tx.send(SessionBinding {
+            session_id: 7,
+            resumed: true,
+            token: "t".into(),
+        })
+        .unwrap();
+        let binding = recv_binding_with_timeout(rx, std::time::Duration::from_millis(250))
+            .await
+            .expect("binding should arrive");
+        assert_eq!(binding.session_id, 7);
+        assert!(binding.resumed);
+    }
+
+    /// Full handshake through `handle_connection`, with a fake compositor that
+    /// replies to the `ClientConnected` reply channel. Verifies the ServerHello
+    /// carries the session id the compositor chose (not a hardcoded value) and
+    /// that `resumed` reflects the reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn handle_connection_uses_reply_binding() {
+        let server_config = build_server_config();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let actual_addr = endpoint.local_addr().unwrap();
+
+        let (comp_to_net_tx, comp_to_net_rx) = mpsc::channel::<CompositorToNet>();
+        let (net_to_comp_tx, net_to_comp_rx) = mpsc::channel::<NetToCompositor>();
+
+        // Fake compositor: wait for ClientConnected, reply with a chosen id.
+        let fake_compositor = std::thread::spawn(move || {
+            loop {
+                match net_to_comp_rx.recv() {
+                    Ok(NetToCompositor::ClientConnected { hello, reply }) => {
+                        assert_eq!(hello.token.as_deref(), Some("session-token"));
+                        reply
+                            .send(SessionBinding {
+                                session_id: 314,
+                                resumed: true,
+                                token: "session-token".into(),
+                            })
+                            .unwrap();
+                    }
+                    Ok(NetToCompositor::ClientDisconnected) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        // Server side: accept the connection and run handle_connection.
+        // The compositor channels are not `Send`, so we drive the server side
+        // on this task via `join!` rather than `tokio::spawn`.
+        let cfg = ServerConfig::default();
+        let server_fut = async {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let _ = handle_connection(&connection, &cfg, &comp_to_net_rx, &net_to_comp_tx).await;
+            let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
+            endpoint.close(0u32.into(), b"done");
+        };
+
+        // Client side: connect, send ClientHello, read ServerHello.
+        let client_fut = async {
+            let client_endpoint = build_test_client_endpoint();
+            let connection = client_endpoint
+                .connect(actual_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut control_send, mut control_recv) = connection.open_bi().await.unwrap();
+            let client_hello = ControlMessage::ClientHello(ClientHello {
+                version: wayray_protocol::PROTOCOL_VERSION,
+                capabilities: vec![],
+                token: Some("session-token".to_string()),
+            });
+            write_message(&mut control_send, &client_hello)
+                .await
+                .unwrap();
+
+            let response: ControlMessage = read_message(&mut control_recv).await.unwrap();
+            let ControlMessage::ServerHello(server_hello) = response else {
+                panic!("expected ServerHello, got {response:?}");
+            };
+            // session_id must equal the value the fake compositor replied with,
+            // proving it is no longer hardcoded.
+            assert_eq!(server_hello.session_id, 314);
+            assert!(server_hello.resumed);
+
+            // Because resumed == true, the server emits a Resumed event next.
+            let next: ControlMessage = read_message(&mut control_recv).await.unwrap();
+            assert!(matches!(
+                next,
+                ControlMessage::SessionEvent(SessionEvent::Resumed { session_id: 314 })
+            ));
+
+            // Tear down: drop client so handle_connection's relay loop ends.
+            drop(control_send);
+            drop(control_recv);
+            drop(connection);
+            let _ = comp_to_net_tx.send(CompositorToNet::Shutdown);
+        };
+
+        tokio::join!(server_fut, client_fut);
+        let _ = fake_compositor.join();
     }
 }

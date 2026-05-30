@@ -51,6 +51,9 @@ pub enum SessionEvent {
     Suspending { session_id: u64 },
     /// Session has been destroyed (client should disconnect).
     Destroyed { session_id: u64 },
+    /// Session was resumed on reconnect (hot-desking). The client should
+    /// clear any frame cache and expect a full redraw.
+    Resumed { session_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

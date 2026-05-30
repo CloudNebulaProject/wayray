@@ -48,6 +48,22 @@ impl SessionRegistry {
         self.sessions.get(&id)
     }
 
+    /// Determine whether a session bound to `token` can be resumed by a
+    /// reconnecting client (hot-desking).
+    ///
+    /// Returns `Some(id)` when a session exists in `Suspended` state (the
+    /// normal disconnect-then-reconnect path) or in `Active` state. An
+    /// `Active` session means the previous endpoint vanished without a clean
+    /// disconnect; the new client may rebind ("steal") it. Returns `None`
+    /// for `Creating`/`Destroyed` sessions or when no session is bound.
+    pub fn is_resumable(&self, token: &SessionToken) -> Option<SessionId> {
+        let session = self.find_by_token(token)?;
+        match session.state {
+            SessionState::Suspended | SessionState::Active => Some(session.id),
+            SessionState::Creating | SessionState::Destroyed => None,
+        }
+    }
+
     /// Transition a session to a new state.
     pub fn transition(
         &mut self,
@@ -218,6 +234,32 @@ mod tests {
         reg.suspend(id1).unwrap();
         assert_eq!(reg.count_by_state(SessionState::Active), 1);
         assert_eq!(reg.count_by_state(SessionState::Suspended), 1);
+    }
+
+    #[test]
+    fn is_resumable_across_lifecycle() {
+        let mut reg = SessionRegistry::new();
+        let token = SessionToken::new("resume-tok");
+        let id = reg.create_session(token.clone());
+
+        // Creating → not resumable yet.
+        assert_eq!(reg.is_resumable(&token), None);
+
+        // Active → resumable (steal path).
+        reg.activate(id).unwrap();
+        assert_eq!(reg.is_resumable(&token), Some(id));
+
+        // Suspended → resumable (normal reconnect path).
+        reg.suspend(id).unwrap();
+        assert_eq!(reg.is_resumable(&token), Some(id));
+
+        // Destroyed → not resumable, token index cleared.
+        reg.activate(id).unwrap();
+        reg.destroy(id).unwrap();
+        assert_eq!(reg.is_resumable(&token), None);
+
+        // Unknown token → not resumable.
+        assert_eq!(reg.is_resumable(&SessionToken::new("nope")), None);
     }
 
     #[test]

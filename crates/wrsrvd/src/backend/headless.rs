@@ -214,42 +214,76 @@ fn drain_network_events(data: &mut CalloopData) {
             Ok(NetToCompositor::Input(input_msg)) => {
                 data.state.inject_network_input(input_msg);
             }
-            Ok(NetToCompositor::ClientConnected(hello)) => {
+            Ok(NetToCompositor::ClientConnected { hello, reply }) => {
+                // Time the resolve so we can validate the <500ms hot-desk
+                // reconnect target end-to-end (the network thread blocks on
+                // this reply before composing the ServerHello).
+                let connect_received = std::time::Instant::now();
+
                 let token_str = hello.token.clone().unwrap_or_else(|| {
                     // Generate a token if the client didn't provide one.
                     format!("auto-{}", data.session_registry.list().count() + 1)
                 });
                 let token = SessionToken::new(token_str);
 
-                // Look up existing session or create new one.
-                let (session_id, resumed) =
-                    if let Some(existing) = data.session_registry.find_by_token(&token) {
-                        let id = existing.id;
-                        let was_suspended = existing.state == SessionState::Suspended;
-                        if was_suspended {
-                            if let Err(e) = data.session_registry.activate(id) {
-                                warn!(error = %e, "failed to resume session");
-                            } else {
-                                info!(%id, "session resumed");
+                // Resolve the session: resume a suspended one, rebind ("steal")
+                // an active one whose old endpoint vanished, or create new.
+                let (session_id, resumed) = match data.session_registry.is_resumable(&token) {
+                    Some(id) => {
+                        let state = data
+                            .session_registry
+                            .get(id)
+                            .map(|s| s.state)
+                            .unwrap_or(SessionState::Destroyed);
+                        match state {
+                            SessionState::Suspended => {
+                                if let Err(e) = data.session_registry.activate(id) {
+                                    warn!(error = %e, "failed to resume session");
+                                } else {
+                                    info!(%id, "session resumed");
+                                }
                             }
+                            SessionState::Active => {
+                                // Hot-desk steal: previous endpoint never sent a
+                                // clean disconnect. Reuse the id without a state
+                                // transition (it is already Active).
+                                info!(%id, "session rebound to new endpoint (steal)");
+                            }
+                            _ => {}
                         }
-                        (id, was_suspended)
-                    } else {
+                        (id, true)
+                    }
+                    None => {
                         let id = data.session_registry.create_session(token.clone());
                         if let Err(e) = data.session_registry.activate(id) {
                             warn!(error = %e, "failed to activate new session");
                         }
                         (id, false)
-                    };
+                    }
+                };
 
                 data.active_session = Some(session_id);
                 data.client_connected = true;
+
+                // Reply to the network thread with the resolved binding so it
+                // can compose an accurate ServerHello.
+                if reply
+                    .send(crate::network::SessionBinding {
+                        session_id: session_id.raw(),
+                        resumed,
+                        token: token.0.clone(),
+                    })
+                    .is_err()
+                {
+                    warn!("network thread dropped session binding reply channel");
+                }
 
                 info!(
                     version = hello.version,
                     %session_id,
                     resumed,
                     %token,
+                    resolve_us = connect_received.elapsed().as_micros() as u64,
                     "remote client connected"
                 );
             }
