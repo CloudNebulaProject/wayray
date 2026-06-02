@@ -43,6 +43,12 @@ struct App {
     display: Option<Display>,
     /// The window reference.
     window: Option<Arc<Window>>,
+    /// Last-known modifier state. winit reports modifier *releases* via
+    /// `ModifiersChanged` (and on macOS not always via `KeyboardInput`), so we
+    /// treat `ModifiersChanged` as the source of truth and synthesize key
+    /// press/release events from it — otherwise a released modifier (e.g.
+    /// Shift) can get stuck "down" on the server, shifting all later input.
+    modifiers: winit::keyboard::ModifiersState,
 }
 
 impl App {
@@ -59,6 +65,7 @@ impl App {
             input_tx,
             display: None,
             window: None,
+            modifiers: winit::keyboard::ModifiersState::empty(),
         }
     }
 
@@ -178,6 +185,16 @@ impl ApplicationHandler for App {
                 if let Some(msg) = input::convert_keyboard(&event) {
                     self.send_input(msg);
                 }
+            }
+            WindowEvent::ModifiersChanged(new_mods) => {
+                // Synthesize modifier key press/release from the authoritative
+                // modifier state so a release is never lost (which would leave
+                // e.g. Shift stuck down on the server).
+                let new_state = new_mods.state();
+                for msg in input::convert_modifiers(self.modifiers, new_state) {
+                    self.send_input(msg);
+                }
+                self.modifiers = new_state;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let msg = input::convert_cursor_moved(position);

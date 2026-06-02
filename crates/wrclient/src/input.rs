@@ -7,15 +7,42 @@ use wayray_protocol::messages::{
     ButtonState, InputMessage, KeyState, KeyboardEvent, PointerAxis, PointerButton, PointerMotion,
 };
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+
+/// evdev keycodes for the modifiers synced from `ModifiersChanged`.
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTALT: u32 = 56;
+const KEY_LEFTMETA: u32 = 125;
+
+/// Whether a physical key is a modifier driven via [`convert_modifiers`]
+/// instead of the regular key path (so it is neither sent twice nor left
+/// stuck "down" when its release is reported only via `ModifiersChanged`).
+fn is_modifier_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::ShiftLeft
+            | KeyCode::ShiftRight
+            | KeyCode::ControlLeft
+            | KeyCode::ControlRight
+            | KeyCode::AltLeft
+            | KeyCode::AltRight
+            | KeyCode::SuperLeft
+            | KeyCode::SuperRight
+    )
+}
 
 /// Convert a winit keyboard event to a protocol `InputMessage`.
 ///
-/// Returns `None` for keys we cannot map (e.g. `Unidentified`).
+/// Returns `None` for keys we cannot map (e.g. `Unidentified`) and for
+/// modifier keys, which are driven from [`convert_modifiers`] instead.
 pub fn convert_keyboard(event: &winit::event::KeyEvent) -> Option<InputMessage> {
     let PhysicalKey::Code(code) = event.physical_key else {
         return None;
     };
+    if is_modifier_key(code) {
+        return None;
+    }
 
     let keycode = keycode_to_evdev(code)?;
     let state = match event.state {
@@ -28,6 +55,33 @@ pub fn convert_keyboard(event: &winit::event::KeyEvent) -> Option<InputMessage> 
         state,
         time: 0, // winit doesn't provide timestamps on key events
     }))
+}
+
+/// Emit synthetic modifier key press/release events for every modifier whose
+/// state changed between `prev` and `now`. Driving modifiers from winit's
+/// authoritative `ModifiersChanged` state (rather than per-key events) ensures
+/// a release is never lost — which would otherwise leave a modifier such as
+/// Shift stuck down on the server, shifting all subsequent input.
+pub fn convert_modifiers(prev: ModifiersState, now: ModifiersState) -> Vec<InputMessage> {
+    let mut out = Vec::new();
+    let mut emit = |was: bool, is: bool, keycode: u32| {
+        if was != is {
+            out.push(InputMessage::Keyboard(KeyboardEvent {
+                keycode,
+                state: if is {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                },
+                time: 0,
+            }));
+        }
+    };
+    emit(prev.shift_key(), now.shift_key(), KEY_LEFTSHIFT);
+    emit(prev.control_key(), now.control_key(), KEY_LEFTCTRL);
+    emit(prev.alt_key(), now.alt_key(), KEY_LEFTALT);
+    emit(prev.super_key(), now.super_key(), KEY_LEFTMETA);
+    out
 }
 
 /// Convert a winit cursor-moved event to a protocol `InputMessage`.
