@@ -75,6 +75,45 @@ impl App {
             warn!("network thread closed, cannot send input");
         }
     }
+
+    /// Drain pending frames from the network thread into the GPU texture.
+    /// Each [`FrameData`] is a complete framebuffer snapshot, so coalescing
+    /// multiple into the last is correct. Returns whether any were applied.
+    fn drain_frames(&mut self) -> bool {
+        let mut got = false;
+        while let Ok(frame) = self.frame_rx.try_recv() {
+            if let Some(display) = &self.display {
+                display.update_frame(&frame.pixels);
+                got = true;
+            }
+        }
+        got
+    }
+
+    /// Present the current frame to the window. We render directly when frames
+    /// arrive (from `about_to_wait`/`user_event`) rather than relying on a
+    /// `RedrawRequested` triggered by `request_redraw()`: on macOS that
+    /// callback is delivered unreliably for proxy-woken redraws, which left the
+    /// window black on connect and dropped later updates.
+    fn present(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(display) = &mut self.display else {
+            return;
+        };
+        match display.render() {
+            Ok(()) => {}
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                error!("GPU out of memory, exiting");
+                event_loop.exit();
+            }
+            Err(e) => {
+                // Lost/outdated surfaces are reconfigured inside render().
+                warn!(error = %e, "render error, will retry");
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -111,36 +150,16 @@ impl ApplicationHandler for App {
         );
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drain any pending frames from the network thread.
-        // The network thread wakes us via EventLoopProxy when frames arrive,
-        // so we don't need to busy-poll.
-        let mut got_frame = false;
-        while let Ok(frame) = self.frame_rx.try_recv() {
-            if let Some(display) = &self.display {
-                display.update_frame(&frame.pixels);
-                got_frame = true;
-            }
-        }
-
-        if got_frame && let Some(window) = &self.window {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.drain_frames() {
+            self.present(event_loop);
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        // Woken by the network thread — new frame available.
-        // The actual frame processing happens in about_to_wait.
-        // Just request a redraw check.
-        let mut got_frame = false;
-        while let Ok(frame) = self.frame_rx.try_recv() {
-            if let Some(display) = &self.display {
-                display.update_frame(&frame.pixels);
-                got_frame = true;
-            }
-        }
-        if got_frame && let Some(window) = &self.window {
-            window.request_redraw();
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        // Woken by the network thread — drain and present any new frames.
+        if self.drain_frames() {
+            self.present(event_loop);
         }
     }
 
@@ -163,23 +182,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(display) = &mut self.display {
-                    match display.render() {
-                        Ok(()) => {}
-                        Err(wgpu::SurfaceError::OutOfMemory) => {
-                            error!("GPU out of memory, exiting");
-                            event_loop.exit();
-                        }
-                        Err(e) => {
-                            // Lost/outdated surfaces are handled inside render(),
-                            // just request another redraw.
-                            warn!(error = %e, "render error, will retry");
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                        }
-                    }
-                }
+                self.present(event_loop);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let real_shift = self.modifiers.shift_key();
