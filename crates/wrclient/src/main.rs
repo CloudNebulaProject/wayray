@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use wayray_protocol::messages::InputMessage;
@@ -154,6 +154,15 @@ impl ApplicationHandler for App {
         if self.drain_frames() {
             self.present(event_loop);
         }
+        // Wake again shortly to present frames that arrive while idle. The
+        // network thread's `proxy.send_event` wake is not reliably delivered on
+        // macOS from `ControlFlow::Wait` (frames then only appeared on the next
+        // OS event — a click or keypress), so poll at ~the display rate. This is
+        // cheap when idle: the server skips unchanged frames, so most wakes find
+        // an empty channel and present nothing.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(16),
+        ));
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
