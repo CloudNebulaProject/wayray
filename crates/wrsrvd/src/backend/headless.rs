@@ -61,6 +61,12 @@ struct CalloopData {
     frame_sequence: u64,
     /// Whether a remote client is currently connected.
     client_connected: bool,
+    /// Force the next frame to be a full keyframe (diffed against a zero
+    /// buffer) rather than a damage-limited delta. Set when a client connects
+    /// mid-stream: its local framebuffer starts black and it can only apply
+    /// XOR deltas forward, so the first frame it receives must be a
+    /// self-contained full-frame keyframe or the image stays black.
+    force_keyframe: bool,
     /// Session registry tracking all sessions by token.
     session_registry: SessionRegistry,
     /// The currently active session ID (if any).
@@ -214,6 +220,7 @@ pub fn run(
         previous_frame,
         frame_sequence: 0,
         client_connected: false,
+        force_keyframe: false,
         session_registry,
         active_session: None,
         cluster,
@@ -384,6 +391,16 @@ fn drain_network_events(data: &mut CalloopData) {
 
                 data.active_session = Some(session_id);
                 data.client_connected = true;
+
+                // A client (new or resumed) joins with an all-black local
+                // framebuffer and reconstructs the image by XORing the deltas
+                // we send onto it. Diffing against our long-running
+                // previous_frame would only ever convey post-join changes, so a
+                // static desktop renders black. Reset the diff base to zero and
+                // force a full-frame send so the next frame is a keyframe the
+                // client can reconstruct from black.
+                data.previous_frame.fill(0);
+                data.force_keyframe = true;
 
                 // Publish the live active-session count and resumable token set
                 // so peer ServerInfo / SessionLookup queries see an accurate
@@ -731,7 +748,10 @@ fn send_frame_to_network(
     // Encode damaged regions. If damage tracking reports specific rects, use those;
     // otherwise encode the full frame as a single region.
     let regions: Vec<_> = match damage {
-        Some(rects) if !rects.is_empty() => rects
+        // A forced keyframe must carry the whole frame regardless of the
+        // damage tracker's (possibly tiny) reported rects, so the joining
+        // client gets a complete image rather than a few damaged tiles.
+        Some(rects) if !rects.is_empty() && !data.force_keyframe => rects
             .iter()
             .map(|rect| {
                 encoding::encode_region(
@@ -757,6 +777,10 @@ fn send_frame_to_network(
             )]
         }
     };
+
+    // The keyframe (if any) has now been encoded into `regions`; clear the
+    // flag so subsequent frames resume normal damage-limited delta encoding.
+    data.force_keyframe = false;
 
     data.frame_sequence += 1;
     let frame_update = FrameUpdate {
