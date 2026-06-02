@@ -48,6 +48,12 @@ pub struct WayRay {
     pub window_ids: Vec<(wm::types::WindowId, smithay::desktop::Window)>,
     /// Counter for allocating WindowIds.
     next_window_id: u64,
+    /// evdev keycodes currently held down via the network input stream. The
+    /// compositor's keyboard state lives on the seat and outlives any single
+    /// client connection, so a key still down when a client drops would stay
+    /// "pressed" into the resumed session. We track held keys here and release
+    /// them on disconnect so a (re)connecting client always starts clean.
+    pressed_keys: std::collections::HashSet<u32>,
     // Kept alive to maintain their Wayland globals — not accessed directly.
     _output_manager_state: OutputManagerState,
     _xdg_decoration_state: XdgDecorationState,
@@ -94,6 +100,7 @@ impl WayRay {
             wm_state,
             window_ids: Vec::new(),
             next_window_id: 1,
+            pressed_keys: std::collections::HashSet::new(),
             _output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
             _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
         }
@@ -290,6 +297,36 @@ impl WayRay {
         }
     }
 
+    /// Release every key currently held via the network input stream.
+    ///
+    /// Call this when a client disconnects: the seat keyboard state outlives the
+    /// connection, so any key still down (a modifier mid-chord, an abrupt drop)
+    /// would otherwise stay "pressed" into the resumed session — shifting or
+    /// repeating subsequent input. Releasing them returns the keyboard to a
+    /// clean state that matches a freshly-(re)connecting client, which holds
+    /// nothing.
+    pub fn release_all_keys(&mut self) {
+        if self.pressed_keys.is_empty() {
+            return;
+        }
+        let held: Vec<u32> = self.pressed_keys.drain().collect();
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        for keycode in held {
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = self.clock.now().as_millis();
+            keyboard.input::<(), _>(
+                self,
+                (keycode + 8).into(),
+                smithay::backend::input::KeyState::Released,
+                serial,
+                time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+    }
+
     /// Inject an input event received from a network client into the
     /// compositor's seat, following the same patterns as `process_input_event`.
     pub fn inject_network_input(&mut self, msg: InputMessage) {
@@ -347,6 +384,12 @@ impl WayRay {
                     ev.time,
                     |_, _, _| FilterResult::Forward,
                 );
+                // Track held keys so we can release them if the client drops.
+                if pressed {
+                    self.pressed_keys.insert(ev.keycode);
+                } else {
+                    self.pressed_keys.remove(&ev.keycode);
+                }
             }
             InputMessage::PointerMotion(ev) => {
                 let serial = SERIAL_COUNTER.next_serial();

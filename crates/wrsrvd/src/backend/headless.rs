@@ -430,6 +430,9 @@ fn drain_network_events(data: &mut CalloopData) {
                 );
             }
             Ok(NetToCompositor::ClientDisconnected) => {
+                // Release any keys the departing client left held so the
+                // keyboard state doesn't leak into the resumed session.
+                data.state.release_all_keys();
                 // Suspend the session instead of destroying it.
                 if let Some(session_id) = data.active_session.take() {
                     if let Err(e) = data.session_registry.suspend(session_id) {
