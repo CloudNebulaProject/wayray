@@ -102,12 +102,20 @@ impl Display {
 
         let window_size = window.inner_size();
         let surface_caps = surface.get_capabilities(&adapter);
+        // The server sends frames as already-display-encoded BGRA bytes, and the
+        // frame texture is linear (`Bgra8Unorm`). Present them verbatim by
+        // choosing a NON-sRGB (linear) surface: an sRGB surface makes the
+        // hardware apply a linear->sRGB conversion on write that the linear
+        // texture doesn't compensate for, which crushed the image dark on
+        // macOS/Metal (the conversion is a no-op under llvmpipe, so Linux looked
+        // fine and hid the bug).
         let surface_format = surface_caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
             .copied()
+            .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
+        info!(?surface_format, "selected surface format");
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
