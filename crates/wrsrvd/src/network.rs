@@ -227,7 +227,11 @@ fn load_or_generate_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stat
     let cert_der = CertificateDer::from(cert);
     let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).expect("key serialization");
 
-    if let Err(e) = std::fs::write(&cert_path, cert_der.as_ref())
+    // Create the identity directory first; without it the writes below fail
+    // with ENOENT, the cert falls back to ephemeral, and the fingerprint
+    // changes every restart — tripping clients' certificate pinning.
+    if let Err(e) = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(&cert_path, cert_der.as_ref()))
         .and_then(|_| wayray_protocol::tls::write_private(&key_path, &key_pair.serialize_der()))
     {
         warn!(error = %e, dir = %dir.display(), "could not persist server certificate; using an ephemeral one (clients must re-pin after restart)");
