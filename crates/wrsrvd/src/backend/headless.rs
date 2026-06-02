@@ -745,6 +745,14 @@ fn send_frame_to_network(
     height: i32,
     stride: usize,
 ) {
+    // Skip frames where nothing changed (unless a keyframe is forced for a
+    // (re)connecting client). A static screen otherwise streams ~60 identical
+    // full frames/sec, which the client must decode and re-render every tick —
+    // wasted network, CPU and battery for no visible change.
+    if !data.force_keyframe && current_pixels == data.previous_frame.as_slice() {
+        return;
+    }
+
     // Compute XOR diff.
     let diff = encoding::xor_diff(current_pixels, &data.previous_frame);
 
