@@ -32,29 +32,71 @@ fn is_modifier_key(code: KeyCode) -> bool {
     )
 }
 
-/// Convert a winit keyboard event to a protocol `InputMessage`.
+/// Convert a winit keyboard event to protocol `InputMessage`(s).
 ///
-/// Returns `None` for keys we cannot map (e.g. `Unidentified`) and for
-/// modifier keys, which are driven from [`convert_modifiers`] instead.
-pub fn convert_keyboard(event: &winit::event::KeyEvent) -> Option<InputMessage> {
+/// Returns an empty vec for keys we cannot map (e.g. `Unidentified`), for
+/// modifier keys (driven from [`convert_modifiers`]) and for CapsLock — which
+/// is deliberately *not* forwarded so the compositor never holds an independent
+/// caps-lock that could diverge from the client's local lock. Letter casing is
+/// instead derived from the client's already-resolved `text` (see below), which
+/// reflects the local caps lock and layout on every platform.
+///
+/// `real_shift` is the physical Shift state (from `ModifiersChanged`), used to
+/// decide when caps lock — not Shift — is responsible for a letter's case.
+pub fn convert_keyboard(event: &winit::event::KeyEvent, real_shift: bool) -> Vec<InputMessage> {
     let PhysicalKey::Code(code) = event.physical_key else {
-        return None;
+        return Vec::new();
     };
-    if is_modifier_key(code) {
-        return None;
+    if is_modifier_key(code) || code == KeyCode::CapsLock {
+        return Vec::new();
     }
 
-    let keycode = keycode_to_evdev(code)?;
-    let state = match event.state {
-        ElementState::Pressed => KeyState::Pressed,
-        ElementState::Released => KeyState::Released,
+    let Some(keycode) = keycode_to_evdev(code) else {
+        return Vec::new();
     };
-
-    Some(InputMessage::Keyboard(KeyboardEvent {
+    let pressed = matches!(event.state, ElementState::Pressed);
+    let key = InputMessage::Keyboard(KeyboardEvent {
         keycode,
-        state,
+        state: if pressed {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        },
         time: 0, // winit doesn't provide timestamps on key events
-    }))
+    });
+
+    // Caps-lock correction. For a letter press, the resolved `text` already
+    // bakes in the client's caps lock + Shift. If the intended case differs
+    // from the physical Shift state, caps lock is responsible — bracket the
+    // press with a temporary Shift toggle so the compositor (which holds no
+    // caps lock) still produces the right case, then restore Shift to the
+    // physical state so held-Shift shortcuts are unaffected.
+    if pressed {
+        if let Some(text) = event.text.as_ref() {
+            let mut chars = text.chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                if c.is_ascii_alphabetic() {
+                    let want_upper = c.is_ascii_uppercase();
+                    if want_upper != real_shift {
+                        let shift = |down: bool| {
+                            InputMessage::Keyboard(KeyboardEvent {
+                                keycode: KEY_LEFTSHIFT,
+                                state: if down {
+                                    KeyState::Pressed
+                                } else {
+                                    KeyState::Released
+                                },
+                                time: 0,
+                            })
+                        };
+                        return vec![shift(want_upper), key, shift(real_shift)];
+                    }
+                }
+            }
+        }
+    }
+
+    vec![key]
 }
 
 /// Emit synthetic modifier key press/release events for every modifier whose

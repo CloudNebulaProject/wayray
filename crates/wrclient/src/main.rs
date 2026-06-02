@@ -182,7 +182,8 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(msg) = input::convert_keyboard(&event) {
+                let real_shift = self.modifiers.shift_key();
+                for msg in input::convert_keyboard(&event, real_shift) {
                     self.send_input(msg);
                 }
             }
