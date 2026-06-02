@@ -780,6 +780,7 @@ fn send_frame_to_network(
 
     // The keyframe (if any) has now been encoded into `regions`; clear the
     // flag so subsequent frames resume normal damage-limited delta encoding.
+    let is_keyframe = data.force_keyframe;
     data.force_keyframe = false;
 
     data.frame_sequence += 1;
@@ -791,15 +792,20 @@ fn send_frame_to_network(
     tracing::debug!(
         sequence = data.frame_sequence,
         regions = frame_update.regions.len(),
+        is_keyframe,
         "sending frame to client"
     );
 
-    if data
-        .net_handle
-        .tx
-        .send(CompositorToNet::SendFrame(frame_update))
-        .is_err()
-    {
+    // Tag keyframes so the network thread can resync a freshly-(re)connected
+    // client to a full frame, discarding any stale deltas queued for the
+    // previous connection.
+    let msg = if is_keyframe {
+        CompositorToNet::SendKeyframe(frame_update)
+    } else {
+        CompositorToNet::SendFrame(frame_update)
+    };
+
+    if data.net_handle.tx.send(msg).is_err() {
         warn!("failed to send frame to network thread");
         data.client_connected = false;
     }

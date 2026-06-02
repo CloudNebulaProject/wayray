@@ -44,8 +44,14 @@ pub type LocalTokens = Arc<Mutex<HashSet<String>>>;
 
 /// Messages sent from the compositor to the network thread.
 pub enum CompositorToNet {
-    /// Send a frame update to the connected client.
+    /// Send an incremental (damage-diff) frame update to the connected client.
     SendFrame(FrameUpdate),
+    /// Send a full keyframe — a complete frame diffed against an all-zero base,
+    /// so a client starting from a black framebuffer reconstructs the full
+    /// image. Marks the start of the valid stream for a freshly-(re)connected
+    /// client; the network thread discards any stale incremental frames queued
+    /// for a previous connection until it sees one of these.
+    SendKeyframe(FrameUpdate),
     /// Shut down the network thread.
     Shutdown,
 }
@@ -626,6 +632,10 @@ async fn serve_client(
     // with handling control messages and compositor commands.
     let mut input_recv: Option<quinn::RecvStream> = None;
     let mut accepting_input = true;
+    // Gate frame forwarding until this connection receives its keyframe, so a
+    // (re)connecting client never starts from a stale delta left in the shared
+    // channel by the previous connection.
+    let mut keyframe_seen = false;
 
     loop {
         tokio::select! {
@@ -676,6 +686,7 @@ async fn serve_client(
             _ = check_compositor_commands(
                 compositor_rx,
                 &mut display_send,
+                &mut keyframe_seen,
             ) => {
                 // Shutdown requested.
                 return Ok(());
@@ -689,13 +700,31 @@ async fn serve_client(
 async fn check_compositor_commands(
     rx: &mpsc::Receiver<CompositorToNet>,
     display_send: &mut quinn::SendStream,
+    keyframe_seen: &mut bool,
 ) {
     loop {
         match rx.try_recv() {
             Ok(CompositorToNet::SendFrame(frame)) => {
+                // Until this connection has received its keyframe, any
+                // incremental frame in the channel is stale (queued for the
+                // previous connection) and would corrupt the client's
+                // black-initialized framebuffer. Drop it.
+                if !*keyframe_seen {
+                    continue;
+                }
                 let msg = DisplayMessage::FrameUpdate(frame);
                 if let Err(e) = write_message(display_send, &msg).await {
                     warn!("failed to send frame: {e}");
+                    return;
+                }
+            }
+            Ok(CompositorToNet::SendKeyframe(frame)) => {
+                // A keyframe is a complete frame; it resyncs the client and
+                // marks the start of this connection's valid stream.
+                *keyframe_seen = true;
+                let msg = DisplayMessage::FrameUpdate(frame);
+                if let Err(e) = write_message(display_send, &msg).await {
+                    warn!("failed to send keyframe: {e}");
                     return;
                 }
             }
