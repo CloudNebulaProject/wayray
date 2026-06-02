@@ -349,27 +349,67 @@ async fn server_loop(
         client_tx,
     ));
 
-    loop {
-        tokio::select! {
-            routed = client_rx.recv() => {
-                match routed {
-                    Some(rc) => {
-                        info!(remote = %rc.connection.remote_address(), "client session starting");
-                        if let Err(e) = serve_client(rc, &config, &compositor_rx, &compositor_tx).await {
-                            warn!("client session ended: {e}");
-                        }
-                        let _ = compositor_tx.send(NetToCompositor::ClientDisconnected);
-                        info!("client disconnected, waiting for next connection");
-                    }
-                    None => {
-                        info!("acceptor stopped");
-                        break;
-                    }
+    // Serve clients one at a time, but let a newly-arriving client PREEMPT the
+    // current one. Without preemption, a client that drops ungracefully (crash,
+    // network loss, killed endpoint) keeps its serve loop alive until QUIC's
+    // idle timeout (~30s); a reconnect with the same token would stall that
+    // whole time. Preemption suspends the stale session immediately and serves
+    // the newcomer — the SunRay hot-desk takeover, authorized by possession of
+    // the (unguessable, TLS-protected) session token.
+    'serve: loop {
+        // Idle: wait for the next client, or a shutdown request.
+        let mut rc = tokio::select! {
+            routed = client_rx.recv() => match routed {
+                Some(rc) => rc,
+                None => {
+                    info!("acceptor stopped");
+                    break 'serve;
                 }
-            }
+            },
             _ = check_shutdown_async(&compositor_rx) => {
                 info!("network: shutdown requested");
-                break;
+                break 'serve;
+            }
+        };
+
+        // Serve the current client until it disconnects on its own or a new
+        // connection arrives and takes over.
+        loop {
+            info!(remote = %rc.connection.remote_address(), "client session starting");
+            let serve = serve_client(rc, &config, &compositor_rx, &compositor_tx);
+            tokio::pin!(serve);
+
+            tokio::select! {
+                // Current client finished (clean disconnect or stream error).
+                res = &mut serve => {
+                    if let Err(e) = res {
+                        warn!("client session ended: {e}");
+                    }
+                    let _ = compositor_tx.send(NetToCompositor::ClientDisconnected);
+                    info!("client disconnected, waiting for next connection");
+                    continue 'serve;
+                }
+                // A new client arrived while we were still serving the old one.
+                // Suspend the stale session and switch to the newcomer instead
+                // of waiting for the old connection's idle timeout.
+                newcomer = client_rx.recv() => match newcomer {
+                    Some(new_rc) => {
+                        warn!(
+                            new_remote = %new_rc.connection.remote_address(),
+                            "new connection preempts in-progress session (hot-desk takeover)"
+                        );
+                        // Suspend the stale session, then loop to serve the
+                        // newcomer. The old `serve` future (and its connection)
+                        // drops at the end of this iteration.
+                        let _ = compositor_tx.send(NetToCompositor::ClientDisconnected);
+                        rc = new_rc;
+                    }
+                    None => {
+                        let _ = compositor_tx.send(NetToCompositor::ClientDisconnected);
+                        info!("acceptor stopped");
+                        break 'serve;
+                    }
+                }
             }
         }
     }
