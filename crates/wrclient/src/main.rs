@@ -49,8 +49,6 @@ struct App {
     /// press/release events from it — otherwise a released modifier (e.g.
     /// Shift) can get stuck "down" on the server, shifting all later input.
     modifiers: winit::keyboard::ModifiersState,
-    /// Event-loop wake counter (diagnostic heartbeat).
-    wake_count: u64,
 }
 
 impl App {
@@ -68,7 +66,6 @@ impl App {
             display: None,
             window: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
-            wake_count: 0,
         }
     }
 
@@ -76,17 +73,6 @@ impl App {
     fn send_input(&self, msg: InputMessage) {
         if self.input_tx.send(msg).is_err() {
             warn!("network thread closed, cannot send input");
-        }
-    }
-
-    /// Drain new frames into the texture and, if any arrived, ask the window to
-    /// redraw. The present itself happens in `RedrawRequested` — the only place
-    /// macOS reliably composites to the screen.
-    fn request_present(&mut self) {
-        if self.drain_frames() {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
         }
     }
 
@@ -162,29 +148,21 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Drain new frames and ask the window to redraw; the actual present
-        // happens in RedrawRequested (the only place macOS reliably composites).
-        self.request_present();
-
-        // Poll at ~the display rate so frames that arrive while idle are picked
-        // up without depending on the network thread's `proxy.send_event` wake
-        // (not reliably delivered on macOS from a plain `Wait`). Cheap when
-        // idle: the server skips unchanged frames, so most wakes do nothing.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + std::time::Duration::from_millis(16),
-        ));
-
-        // Heartbeat: if these tick ~60/sec without you interacting, the timed
-        // wake works and the loop is alive. (Diagnostic; logged once/second.)
-        self.wake_count += 1;
-        if self.wake_count.is_multiple_of(60) {
-            info!(wakes = self.wake_count, "event-loop heartbeat");
-        }
+        // Upload any new frames, then present *every* tick. macOS only reliably
+        // composites a CAMetalLayer from a continuous present loop; presenting
+        // only when a new frame arrived left the window stale until an OS event
+        // forced a redraw. The texture changes only on new frames, so a present
+        // is just a cheap fullscreen blit; AutoVsync paces the loop to the
+        // display rate (so Poll does not busy-spin).
+        self.drain_frames();
+        self.present(event_loop);
+        event_loop.set_control_flow(ControlFlow::Poll);
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        // Woken by the network thread — drain and request a redraw.
-        self.request_present();
+        // Woken by the network thread; upload frames now so the next present
+        // (in about_to_wait) shows them promptly.
+        self.drain_frames();
     }
 
     fn window_event(
