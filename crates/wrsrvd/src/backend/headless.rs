@@ -61,12 +61,16 @@ struct CalloopData {
     frame_sequence: u64,
     /// Whether a remote client is currently connected.
     client_connected: bool,
-    /// Force the next frame to be a full keyframe (diffed against a zero
-    /// buffer) rather than a damage-limited delta. Set when a client connects
-    /// mid-stream: its local framebuffer starts black and it can only apply
-    /// XOR deltas forward, so the first frame it receives must be a
-    /// self-contained full-frame keyframe or the image stays black.
+    /// Force the next frame to be a full keyframe (every region, covering the
+    /// whole output) rather than a damage-limited delta. Set when a client
+    /// (re)connects, periodically as a drift backstop, and on a client
+    /// `RequestKeyframe`.
     force_keyframe: bool,
+    /// Delta frames sent since the last keyframe. When it reaches
+    /// [`KEYFRAME_INTERVAL`] the next frame is promoted to a keyframe, bounding
+    /// how long a missed region can stay stale. Counts only sent frames, so a
+    /// static (skipped) screen never triggers needless keyframes.
+    frames_since_keyframe: u32,
     /// Session registry tracking all sessions by token.
     session_registry: SessionRegistry,
     /// The currently active session ID (if any).
@@ -221,6 +225,7 @@ pub fn run(
         frame_sequence: 0,
         client_connected: false,
         force_keyframe: false,
+        frames_since_keyframe: 0,
         session_registry,
         active_session: None,
         cluster,
@@ -450,6 +455,15 @@ fn drain_network_events(data: &mut CalloopData) {
             }
             Ok(NetToCompositor::Control(ctrl)) => {
                 tracing::debug!(?ctrl, "received control message");
+                // A client that detected drift (checksum mismatch) asks for a
+                // full frame to resynchronize.
+                if matches!(
+                    ctrl,
+                    wayray_protocol::messages::ControlMessage::RequestKeyframe
+                ) {
+                    info!("client requested keyframe (resync)");
+                    data.force_keyframe = true;
+                }
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -690,7 +704,11 @@ fn render_headless_frame(data: &mut CalloopData) {
         &mut data.renderer,
         &mut target,
         1.0,
-        0, // buffer age: 0 means full redraw (no swap chain in headless)
+        // Buffer age 1: the render buffer is reused each frame, so it holds the
+        // previous frame. This yields partial damage (only what changed) for
+        // small, efficient region updates; absolute encoding + the client's
+        // checksum/keyframe recovery keep it correct if a delta is ever missed.
+        1,
         [&data.state.space],
         custom_elements,
         &mut data.damage_tracker,
@@ -735,8 +753,13 @@ fn render_headless_frame(data: &mut CalloopData) {
     }
 }
 
-/// Encode the current frame as XOR diff against the previous frame and
-/// send it to the connected client via the network channel.
+/// Maximum delta frames between keyframes. A keyframe resends the whole frame,
+/// so this bounds how long a region missed due to incomplete damage or frame
+/// loss can stay stale (the client's checksum check usually catches it sooner).
+const KEYFRAME_INTERVAL: u32 = 120;
+
+/// Encode the current frame as absolute damaged regions and send it to the
+/// connected client via the network channel.
 fn send_frame_to_network(
     data: &mut CalloopData,
     current_pixels: &[u8],
@@ -753,11 +776,15 @@ fn send_frame_to_network(
         return;
     }
 
-    // Compute XOR diff.
-    let diff = encoding::xor_diff(current_pixels, &data.previous_frame);
+    // Periodically promote a frame to a full keyframe so any drift from a
+    // missed region is healed even if the client never noticed it.
+    if data.frames_since_keyframe >= KEYFRAME_INTERVAL {
+        data.force_keyframe = true;
+    }
 
-    // Encode damaged regions. If damage tracking reports specific rects, use those;
-    // otherwise encode the full frame as a single region.
+    // Encode damaged regions as absolute pixels. If damage tracking reports
+    // specific rects, encode those; otherwise (or for a forced keyframe) encode
+    // the full frame as a single region.
     let regions: Vec<_> = match damage {
         // A forced keyframe must carry the whole frame regardless of the
         // damage tracker's (possibly tiny) reported rects, so the joining
@@ -766,7 +793,7 @@ fn send_frame_to_network(
             .iter()
             .map(|rect| {
                 encoding::encode_region(
-                    &diff,
+                    current_pixels,
                     stride,
                     rect.loc.x.max(0) as u32,
                     rect.loc.y.max(0) as u32,
@@ -779,7 +806,7 @@ fn send_frame_to_network(
         _ => {
             // Full-frame update.
             vec![encoding::encode_region(
-                &diff,
+                current_pixels,
                 stride,
                 0,
                 0,
@@ -790,14 +817,23 @@ fn send_frame_to_network(
     };
 
     // The keyframe (if any) has now been encoded into `regions`; clear the
-    // flag so subsequent frames resume normal damage-limited delta encoding.
+    // flag so subsequent frames resume normal damage-limited delta encoding,
+    // and track the keyframe cadence.
     let is_keyframe = data.force_keyframe;
     data.force_keyframe = false;
+    if is_keyframe {
+        data.frames_since_keyframe = 0;
+    } else {
+        data.frames_since_keyframe += 1;
+    }
 
     data.frame_sequence += 1;
+    // Checksum of the full visible framebuffer so the client can detect drift.
+    let checksum = encoding::checksum(current_pixels, stride, width as usize * 4, height as usize);
     let frame_update = FrameUpdate {
         sequence: data.frame_sequence,
         regions,
+        checksum,
     };
 
     tracing::debug!(

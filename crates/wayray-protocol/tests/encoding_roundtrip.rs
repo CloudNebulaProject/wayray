@@ -1,9 +1,9 @@
 //! Integration test: encode → compress → decompress → apply.
 //!
-//! Verifies the full XOR diff → zstd → XOR apply pipeline
-//! reconstructs the original framebuffer correctly.
+//! Verifies the absolute-region pipeline (encode region of absolute pixels →
+//! zstd → copy-apply) reconstructs the framebuffer correctly.
 
-use wayray_protocol::encoding::{apply_region, encode_region, xor_diff};
+use wayray_protocol::encoding::{apply_region, encode_region};
 
 #[test]
 fn roundtrip_with_subregion() {
@@ -21,9 +21,8 @@ fn roundtrip_with_subregion() {
         }
     }
 
-    let diff = xor_diff(&curr, &prev);
-    let region = encode_region(&diff, stride, 5, 5, 10, 10);
-
+    // Encode the changed region's absolute pixels, apply onto the prior frame.
+    let region = encode_region(&curr, stride, 5, 5, 10, 10);
     let mut reconstructed = prev;
     apply_region(&mut reconstructed, stride, &region);
     assert_eq!(reconstructed, curr);
@@ -36,15 +35,13 @@ fn roundtrip_unchanged_frame() {
     let stride = width as usize * 4;
     let frame = vec![128u8; stride * height as usize];
 
-    let diff = xor_diff(&frame, &frame);
-    let region = encode_region(&diff, stride, 0, 0, width, height);
-
+    let region = encode_region(&frame, stride, 0, 0, width, height);
     assert!(
         region.data.len() < 200,
-        "all-zero diff should compress well"
+        "uniform region should compress well"
     );
 
-    let mut reconstructed = frame.clone();
+    let mut reconstructed = vec![0u8; frame.len()];
     apply_region(&mut reconstructed, stride, &region);
     assert_eq!(reconstructed, frame);
 }
@@ -71,9 +68,8 @@ fn roundtrip_multiple_regions() {
         }
     }
 
-    let diff = xor_diff(&curr, &prev);
-    let region1 = encode_region(&diff, stride, 0, 0, 10, 10);
-    let region2 = encode_region(&diff, stride, 150, 100, 30, 20);
+    let region1 = encode_region(&curr, stride, 0, 0, 10, 10);
+    let region2 = encode_region(&curr, stride, 150, 100, 30, 20);
 
     let mut reconstructed = prev;
     apply_region(&mut reconstructed, stride, &region1);

@@ -1103,6 +1103,7 @@ mod tests {
             let frame = DisplayMessage::FrameUpdate(FrameUpdate {
                 sequence: 1,
                 regions: vec![],
+                checksum: 0,
             });
             write_message(&mut display_send, &frame).await.unwrap();
 

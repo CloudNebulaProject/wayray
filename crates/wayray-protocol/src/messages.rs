@@ -135,6 +135,10 @@ pub enum ControlMessage {
     },
     /// Response to a `SessionLookupRequest`.
     SessionLookupResponse(SessionLookupResponse),
+    /// Client → server: request a full keyframe. Sent when the client detects
+    /// its reconstructed framebuffer has drifted out of sync (a frame-checksum
+    /// mismatch), so the server resends a complete frame to resynchronize.
+    RequestKeyframe,
     /// Sent in place of (or alongside) `ServerHello` when the client's session
     /// lives on a different server. The client reconnects to `addr`.
     SessionRedirect {
@@ -153,7 +157,10 @@ pub struct DamageRegion {
     pub y: u32,
     pub width: u32,
     pub height: u32,
-    /// zstd-compressed XOR diff pixel data for this region.
+    /// zstd-compressed *absolute* BGRA8 pixels for this region (not a diff), so
+    /// applying it is an idempotent copy — a missed or out-of-order frame can
+    /// never permanently corrupt the reconstruction, only briefly stale a
+    /// region until it is redrawn or a keyframe arrives.
     pub data: Vec<u8>,
 }
 
@@ -161,6 +168,10 @@ pub struct DamageRegion {
 pub struct FrameUpdate {
     pub sequence: u64,
     pub regions: Vec<DamageRegion>,
+    /// Checksum of the server's *full* framebuffer after this frame. The client
+    /// recomputes it over its reconstructed framebuffer and, on mismatch,
+    /// requests a keyframe — detecting and recovering from any drift.
+    pub checksum: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

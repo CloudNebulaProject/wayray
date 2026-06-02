@@ -90,6 +90,7 @@ mod tests {
                 height: 50,
                 data: vec![0, 1, 2, 3],
             }],
+            checksum: 0,
         });
         let encoded = encode(&msg).unwrap();
         let (len, payload) = read_length_prefix(&encoded).unwrap();
@@ -135,6 +136,7 @@ mod tests {
         let msg = DisplayMessage::FrameUpdate(FrameUpdate {
             sequence: 0,
             regions: vec![],
+            checksum: 0,
         });
         let encoded = encode(&msg).unwrap();
         let (len, payload) = read_length_prefix(&encoded).unwrap();

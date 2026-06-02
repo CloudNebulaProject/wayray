@@ -246,6 +246,9 @@ async fn run_session_loop(
     frame_tx: &mpsc::Sender<FrameData>,
     proxy: &EventLoopProxy<()>,
 ) -> SessionEnd {
+    // True while we've asked for a keyframe and are waiting for the resync, so
+    // we don't flood the server with requests every frame during the round-trip.
+    let mut keyframe_pending = false;
     loop {
         // Drain any pending input messages before blocking on frame read.
         while let Ok(input_msg) = input_rx.try_recv() {
@@ -274,6 +277,27 @@ async fn run_session_loop(
                 // Apply damage regions to the persistent framebuffer.
                 for region in &update.regions {
                     wayray_protocol::encoding::apply_region(framebuffer, stride, region);
+                }
+
+                // Verify the reconstruction against the server's checksum. A
+                // mismatch means a frame was missed/reordered and left a region
+                // stale; ask for a keyframe to resync (once, until it lands).
+                let height = framebuffer.len() / stride;
+                let local = wayray_protocol::encoding::checksum(framebuffer, stride, stride, height);
+                if local != update.checksum {
+                    if !keyframe_pending {
+                        warn!(
+                            sequence = update.sequence,
+                            "framebuffer checksum mismatch; requesting keyframe to resync"
+                        );
+                        if let Err(e) = conn.request_keyframe().await {
+                            warn!(error = %e, "failed to request keyframe, reconnecting");
+                            return SessionEnd::Disconnected;
+                        }
+                        keyframe_pending = true;
+                    }
+                } else {
+                    keyframe_pending = false;
                 }
 
                 if frame_tx

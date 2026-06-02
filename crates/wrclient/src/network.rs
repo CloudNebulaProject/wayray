@@ -111,6 +111,12 @@ impl ServerConnection {
         write_message(&mut self.control_send, &msg).await
     }
 
+    /// Ask the server for a full keyframe to resynchronize after detecting the
+    /// reconstructed framebuffer has drifted (a frame-checksum mismatch).
+    pub async fn request_keyframe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        write_message(&mut self.control_send, &ControlMessage::RequestKeyframe).await
+    }
+
     /// Send an input message to the server.
     pub async fn send_input(
         &mut self,
@@ -404,6 +410,7 @@ mod tests {
             let frame = DisplayMessage::FrameUpdate(FrameUpdate {
                 sequence: 7,
                 regions: vec![],
+                checksum: 0,
             });
             write_message(&mut display_send, &frame).await.unwrap();
 
