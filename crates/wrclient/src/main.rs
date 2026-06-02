@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use wayray_protocol::messages::InputMessage;
@@ -137,6 +137,9 @@ impl ApplicationHandler for App {
         // winit's resumed callback cannot be async.
         let display = pollster::block_on(Display::new(win, w, h));
 
+        // Kick off a self-sustaining redraw loop (see RedrawRequested).
+        window.request_redraw();
+
         self.window = Some(window);
         self.display = Some(display);
 
@@ -147,21 +150,9 @@ impl ApplicationHandler for App {
         );
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Upload any new frames, then present *every* tick. macOS only reliably
-        // composites a CAMetalLayer from a continuous present loop; presenting
-        // only when a new frame arrived left the window stale until an OS event
-        // forced a redraw. The texture changes only on new frames, so a present
-        // is just a cheap fullscreen blit; AutoVsync paces the loop to the
-        // display rate (so Poll does not busy-spin).
-        self.drain_frames();
-        self.present(event_loop);
-        event_loop.set_control_flow(ControlFlow::Poll);
-    }
-
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        // Woken by the network thread; upload frames now so the next present
-        // (in about_to_wait) shows them promptly.
+        // Woken by the network thread; upload frames now so the next redraw
+        // (already scheduled in the continuous loop) shows them promptly.
         self.drain_frames();
     }
 
@@ -184,7 +175,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Continuous redraw loop. macOS only composites a Metal layer
+                // from within its own draw cycle (RedrawRequested), not from a
+                // free-running present in about_to_wait — so present here and
+                // immediately schedule the next redraw to keep the cycle going.
+                // The texture only changes when a frame arrives, so a steady
+                // present is just a cheap fullscreen blit (vsync-paced).
+                self.drain_frames();
                 self.present(event_loop);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let real_shift = self.modifiers.shift_key();
