@@ -1,3 +1,4 @@
+pub mod admin;
 mod backend;
 mod errors;
 mod handlers;
@@ -43,6 +44,19 @@ fn main() -> Result<()> {
         .find(|w| w[0] == "--launcher-socket")
         .map(|w| std::path::PathBuf::from(&w[1]))
         .or_else(|| std::env::var_os("WAYRAY_LAUNCHER_SOCKET").map(std::path::PathBuf::from));
+
+    // Optional admin control socket (`--admin-socket [path]` or
+    // WAYRAY_ADMIN_SOCKET) serving `wradm sessions` / `wradm status`. Giving
+    // the flag without a path uses the default location.
+    let admin_socket = match args.iter().position(|a| a == "--admin-socket") {
+        Some(i) => Some(
+            args.get(i + 1)
+                .filter(|next| !next.starts_with("--"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(wayray_protocol::admin::default_admin_socket_path),
+        ),
+        None => std::env::var_os("WAYRAY_ADMIN_SOCKET").map(std::path::PathBuf::from),
+    };
 
     // Load multi-server cluster configuration. `--cluster <path>` overrides the
     // default search locations; absent config means single-server mode.
@@ -122,9 +136,9 @@ fn main() -> Result<()> {
     );
 
     if use_winit {
-        if launcher_socket.is_some() {
+        if launcher_socket.is_some() || admin_socket.is_some() {
             tracing::warn!(
-                "--launcher-socket is only supported by the headless backend; ignoring"
+                "--launcher-socket / --admin-socket are only supported by the headless backend; ignoring"
             );
         }
         #[cfg(feature = "winit")]
@@ -140,5 +154,13 @@ fn main() -> Result<()> {
         }
     }
 
-    backend::headless::run(display, state, output, net_handle, cluster, launcher_socket)
+    backend::headless::run(
+        display,
+        state,
+        output,
+        net_handle,
+        cluster,
+        launcher_socket,
+        admin_socket,
+    )
 }
