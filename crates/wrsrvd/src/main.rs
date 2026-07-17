@@ -55,6 +55,16 @@ fn main() -> Result<()> {
         }
         None => ClusterConfig::load_default(),
     };
+    // Optional session persistence: `--state-db <path>` (or WRSRVD_STATE_DB)
+    // points at a SQLite database where session metadata survives restarts.
+    // Absent means in-memory only (sessions lost on restart) — the previous
+    // behavior.
+    let state_db = args
+        .windows(2)
+        .find(|w| w[0] == "--state-db")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+        .or_else(|| std::env::var_os("WRSRVD_STATE_DB").map(std::path::PathBuf::from));
+
     if cluster.is_clustered() {
         info!(
             local_id = %cluster.local_id,
@@ -124,5 +134,5 @@ fn main() -> Result<()> {
         }
     }
 
-    backend::headless::run(display, state, output, net_handle, cluster)
+    backend::headless::run(display, state, output, net_handle, cluster, state_db)
 }

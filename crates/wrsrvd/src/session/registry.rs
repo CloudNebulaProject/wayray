@@ -1,8 +1,11 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{info, warn};
 
+use super::persistence::{NullStore, SessionStore};
 use super::types::{Session, SessionId, SessionState, SessionToken, SessionTransitionError};
 use wayray_protocol::cluster::DEFAULT_CAPACITY;
 
@@ -53,6 +56,10 @@ pub struct SessionRegistry {
     remote_sessions: HashMap<SessionToken, RemoteEntry>,
     /// Maximum number of sessions this server will host (for load factor).
     capacity: u32,
+    /// Durable backing store, written on every state change. The default
+    /// [`NullStore`] keeps sessions in memory only (lost on restart); see
+    /// [`super::persistence`] for the SQLite store and restore semantics.
+    store: Arc<dyn SessionStore>,
 }
 
 impl SessionRegistry {
@@ -64,7 +71,104 @@ impl SessionRegistry {
             local_server_id: String::new(),
             remote_sessions: HashMap::new(),
             capacity: DEFAULT_CAPACITY,
+            store: Arc::new(NullStore),
         }
+    }
+
+    /// Attach a persistent session store. Subsequent state changes are
+    /// written through to it; call [`Self::restore_persisted`] afterwards to
+    /// load previously persisted sessions.
+    pub fn with_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Enable SQLite persistence at `path` and restore previously persisted
+    /// sessions (see [`super::persistence`] for the restore semantics).
+    ///
+    /// A store that fails to open is logged loudly and the registry keeps
+    /// running in memory: session durability degrades, but the server stays
+    /// available.
+    pub fn enable_persistence(&mut self, path: &Path) {
+        match super::persistence::open_store(path) {
+            Ok(store) => {
+                self.store = store;
+                let restored = self.restore_persisted();
+                info!(
+                    path = %path.display(),
+                    restored,
+                    "session persistence enabled"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to open session state database; \
+                     continuing in-memory — sessions will NOT survive a restart"
+                );
+            }
+        }
+    }
+
+    /// Load persisted sessions from the attached store into the registry.
+    /// Returns the number of sessions restored.
+    ///
+    /// A restarted server has no live surfaces, so `Active` and `Suspended`
+    /// rows are both restored as `Suspended`: the token → session identity
+    /// binding (id, token, user, home server, timeout) survives, and a
+    /// returning client's token resumes into a session with the same
+    /// identity. The suspend clock restarts at boot. `Creating`/`Destroyed`
+    /// rows never represent a resumable desktop and are deleted.
+    pub fn restore_persisted(&mut self) -> usize {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut restored = 0;
+
+        for row in self.store.load_all() {
+            let id = SessionId::from_raw(row.id);
+            // Never reuse a previously issued id, even for rows that are
+            // dropped below — a stale reference to an old id must not alias a
+            // fresh session.
+            self.next_id = self.next_id.max(row.id + 1);
+            match row.state {
+                SessionState::Active | SessionState::Suspended => {
+                    // Best-effort monotonic reconstruction of the wall-clock
+                    // creation time (informational only).
+                    let age = Duration::from_secs(
+                        now_epoch.saturating_sub(row.created_at_epoch).max(0) as u64,
+                    );
+                    let session = Session {
+                        id,
+                        token: SessionToken::new(row.token),
+                        state: SessionState::Suspended,
+                        created_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+                        suspended_at: Some(Instant::now()),
+                        suspend_timeout: row.suspend_timeout,
+                        user: row.user,
+                        home_server: row.home_server,
+                    };
+                    info!(
+                        %id,
+                        user = session.user.as_deref().unwrap_or("<unauthenticated>"),
+                        "restored persisted session as suspended (awaiting token reconnect)"
+                    );
+                    // Write back the (possibly Active → Suspended) state so
+                    // the store matches memory.
+                    self.store.persist(&session);
+                    self.token_index.insert(session.token.clone(), id);
+                    self.sessions.insert(id, session);
+                    restored += 1;
+                }
+                SessionState::Creating | SessionState::Destroyed => {
+                    info!(%id, state = %row.state, "dropping non-resumable persisted session");
+                    self.store.remove(id);
+                }
+            }
+        }
+        restored
     }
 
     /// Create a registry with an explicit local server id and capacity.
@@ -134,6 +238,7 @@ impl SessionRegistry {
         self.next_id += 1;
 
         let session = Session::new(id, token.clone(), self.local_server_id.clone());
+        self.store.persist(&session);
         // A token we now host locally is no longer "remote".
         self.remote_sessions.remove(&token);
         self.token_index.insert(token.clone(), id);
@@ -187,9 +292,13 @@ impl SessionRegistry {
         session.transition(next)?;
         info!(%id, %from, %next, "session state transition");
 
-        // Clean up destroyed sessions from the index.
+        // Clean up destroyed sessions from the index and the store; persist
+        // every other transition so it survives a restart.
         if next == SessionState::Destroyed {
             self.token_index.remove(&session.token);
+            self.store.remove(id);
+        } else {
+            self.store.persist(session);
         }
 
         Ok(())
@@ -214,6 +323,15 @@ impl SessionRegistry {
     pub fn set_user(&mut self, id: SessionId, user: String) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.user = Some(user);
+            self.store.persist(session);
+        }
+    }
+
+    /// Set the suspend timeout for a session.
+    pub fn set_suspend_timeout(&mut self, id: SessionId, timeout: Duration) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.suspend_timeout = timeout;
+            self.store.persist(session);
         }
     }
 

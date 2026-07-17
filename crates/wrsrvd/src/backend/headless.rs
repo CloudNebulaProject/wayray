@@ -112,6 +112,7 @@ pub fn run(
     output: Output,
     net_handle: NetworkHandle,
     cluster: ClusterConfig,
+    state_db: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // Create the PixmanRenderer (CPU software renderer).
     let mut renderer = PixmanRenderer::new().map_err(|e| {
@@ -194,8 +195,13 @@ pub fn run(
     // capacity. The capacity comes from the local server entry's weight scaling
     // (kept simple here: default capacity unless a local entry exists).
     let local_id = cluster.local_id.clone();
-    let session_registry =
+    let mut session_registry =
         SessionRegistry::with_cluster(local_id.clone(), wayray_protocol::cluster::DEFAULT_CAPACITY);
+    // Optional SQLite persistence: restores suspended session identities from
+    // a previous run and write-through-persists all further state changes.
+    if let Some(path) = &state_db {
+        session_registry.enable_persistence(path);
+    }
 
     // A dedicated tokio runtime for short-lived peer `ServerInfo` probes; only
     // needed in a real cluster. Single-server deployments skip it entirely.
