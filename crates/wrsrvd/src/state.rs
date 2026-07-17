@@ -25,7 +25,71 @@ use smithay::{
 use tracing::info;
 use wayray_protocol::messages::InputMessage;
 
-use crate::wm::{self, WmState};
+use crate::wm::{
+    self, WmState,
+    floating::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER},
+};
+
+// Linux evdev keycodes for the modifier keys tracked by [`ModifierTracker`].
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTSHIFT: u32 = 54;
+const KEY_LEFTALT: u32 = 56;
+const KEY_RIGHTCTRL: u32 = 97;
+const KEY_RIGHTALT: u32 = 100;
+const KEY_LEFTMETA: u32 = 125;
+const KEY_RIGHTMETA: u32 = 126;
+
+/// Tracks which modifier keys are currently held on the network input stream
+/// and derives the X11-style modifier bitmask (`MOD_*` in [`wm::floating`])
+/// that WM keybindings — both the protocol's `bind_key` and the built-in WM —
+/// are registered against.
+///
+/// Left and right variants are tracked as distinct keys, so releasing one
+/// while the other is still down keeps the modifier bit set.
+#[derive(Debug, Default)]
+pub struct ModifierTracker {
+    /// Held modifier keycodes (evdev).
+    held: std::collections::HashSet<u32>,
+}
+
+impl ModifierTracker {
+    /// The modifier bit an evdev keycode contributes, if it is a modifier key.
+    fn modifier_bit(keycode: u32) -> Option<u32> {
+        match keycode {
+            KEY_LEFTSHIFT | KEY_RIGHTSHIFT => Some(MOD_SHIFT),
+            KEY_LEFTCTRL | KEY_RIGHTCTRL => Some(MOD_CTRL),
+            KEY_LEFTALT | KEY_RIGHTALT => Some(MOD_ALT),
+            KEY_LEFTMETA | KEY_RIGHTMETA => Some(MOD_SUPER),
+            _ => None,
+        }
+    }
+
+    /// Record a key press or release. Non-modifier keys are ignored.
+    pub fn on_key(&mut self, keycode: u32, pressed: bool) {
+        if Self::modifier_bit(keycode).is_none() {
+            return;
+        }
+        if pressed {
+            self.held.insert(keycode);
+        } else {
+            self.held.remove(&keycode);
+        }
+    }
+
+    /// The bitmask of currently held modifiers.
+    pub fn mask(&self) -> u32 {
+        self.held
+            .iter()
+            .filter_map(|&key| Self::modifier_bit(key))
+            .fold(0, |mask, bit| mask | bit)
+    }
+
+    /// Forget all held modifiers (e.g. when the client disconnects).
+    pub fn reset(&mut self) {
+        self.held.clear();
+    }
+}
 
 /// Central compositor state holding all Smithay subsystem states.
 ///
@@ -54,6 +118,9 @@ pub struct WayRay {
     /// "pressed" into the resumed session. We track held keys here and release
     /// them on disconnect so a (re)connecting client always starts clean.
     pressed_keys: std::collections::HashSet<u32>,
+    /// Held-modifier bitmask derived from network key events, passed to WM
+    /// keybinding checks so chords like Super+Arrow work.
+    modifiers: ModifierTracker,
     // Kept alive to maintain their Wayland globals — not accessed directly.
     _output_manager_state: OutputManagerState,
     _xdg_decoration_state: XdgDecorationState,
@@ -101,6 +168,7 @@ impl WayRay {
             window_ids: Vec::new(),
             next_window_id: 1,
             pressed_keys: std::collections::HashSet::new(),
+            modifiers: ModifierTracker::default(),
             _output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
             _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
         }
@@ -142,11 +210,18 @@ impl WayRay {
 
     /// Apply WM render commands to the Space before frame rendering.
     pub fn apply_wm_render_commands(&mut self) {
-        let output_name = self.output.name();
         let ids: Vec<_> = self.window_ids.iter().map(|(id, _)| *id).collect();
         let commands = self.wm_state.active_wm().on_render(&ids);
+        self.apply_render_commands(commands);
+    }
 
-        for cmd in commands {
+    /// Apply a batch of WM render commands to the Space: position, visibility
+    /// (with workspace/tag/output filtering) and z-order (absolute and
+    /// relative). Used for both the built-in WM and external WM commands.
+    pub fn apply_render_commands(&mut self, commands: Vec<wm::types::RenderCommand>) {
+        let output_name = self.output.name();
+
+        for cmd in &commands {
             // Apply workspace/tag visibility filtering when a protocol WM state
             // exists. The built-in WM assigns no workspaces/tags, so unassigned
             // windows stay visible (is_visible returns true) and behavior is
@@ -168,6 +243,28 @@ impl WayRay {
                     self.space.map_element(window, cmd.position, false);
                 } else {
                     self.space.unmap_elem(&window);
+                }
+            }
+        }
+
+        // Apply z-order directives in a second pass: compute the desired
+        // stacking order from the Space's current one, then raise the windows
+        // bottom-to-top so the Space ends up in exactly that order.
+        if commands
+            .iter()
+            .any(|cmd| cmd.z_order != wm::types::ZOrder::Preserve)
+        {
+            let current: Vec<wm::types::WindowId> = self
+                .space
+                .elements()
+                .filter_map(|window| self.window_id_for(window))
+                .collect();
+            let desired = wm::types::restack(&current, &commands);
+            if desired != current {
+                for id in desired {
+                    if let Some(window) = self.window_for_id(id).cloned() {
+                        self.space.raise_element(&window, false);
+                    }
                 }
             }
         }
@@ -306,6 +403,8 @@ impl WayRay {
     /// clean state that matches a freshly-(re)connecting client, which holds
     /// nothing.
     pub fn release_all_keys(&mut self) {
+        // The departing client's modifiers are no longer held either.
+        self.modifiers.reset();
         if self.pressed_keys.is_empty() {
             return;
         }
@@ -334,15 +433,25 @@ impl WayRay {
             InputMessage::Keyboard(ev) => {
                 let pressed = matches!(ev.state, wayray_protocol::messages::KeyState::Pressed);
 
+                // Track held modifiers before the binding checks so a chorded
+                // key (e.g. Super+Left) sees the modifier already held down.
+                self.modifiers.on_key(ev.keycode, pressed);
+                let modifiers = self.modifiers.mask();
+
                 // Check if an external WM wants this key.
                 if let Some(proto) = &self.wm_state.protocol
-                    && proto.check_key_binding(ev.keycode, 0, pressed)
+                    && proto.check_key_binding(ev.keycode, modifiers, pressed)
                 {
                     return;
                 }
 
                 // Check if the built-in WM wants this key (only on press).
-                if pressed && self.wm_state.active_wm().on_key_binding(ev.keycode, 0) {
+                if pressed
+                    && self
+                        .wm_state
+                        .active_wm()
+                        .on_key_binding(ev.keycode, modifiers)
+                {
                     // Alt+F4: close the focused window.
                     if ev.keycode == crate::wm::floating::KEY_F4
                         && let Some(focused) = self.wm_state.builtin.focused()
@@ -361,6 +470,24 @@ impl WayRay {
                         let keyboard = self.seat.get_keyboard().unwrap();
                         let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
                         keyboard.set_focus(self, wl_surface, serial);
+                    }
+                    // Super+Arrow: the snap changed the focused window's size —
+                    // send a configure (the position flows via on_render).
+                    if matches!(
+                        ev.keycode,
+                        crate::wm::floating::KEY_LEFT
+                            | crate::wm::floating::KEY_RIGHT
+                            | crate::wm::floating::KEY_UP
+                            | crate::wm::floating::KEY_DOWN
+                    ) && let Some(focused) = self.wm_state.builtin.focused()
+                        && let Some((_, size)) = self.wm_state.builtin.geometry_of(focused)
+                        && let Some(window) = self.window_for_id(focused).cloned()
+                        && let Some(toplevel) = window.toplevel()
+                    {
+                        toplevel.with_pending_state(|state| {
+                            state.size = Some(size.into());
+                        });
+                        toplevel.send_pending_configure();
                     }
                     return;
                 }
@@ -475,5 +602,84 @@ impl WayRay {
                 pointer.frame(self);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_tracker_has_no_modifiers() {
+        let tracker = ModifierTracker::default();
+        assert_eq!(tracker.mask(), 0);
+    }
+
+    #[test]
+    fn press_and_release_toggle_modifier_bits() {
+        // (keycode, expected bit) for every tracked modifier key.
+        let cases = [
+            (KEY_LEFTSHIFT, MOD_SHIFT),
+            (KEY_RIGHTSHIFT, MOD_SHIFT),
+            (KEY_LEFTCTRL, MOD_CTRL),
+            (KEY_RIGHTCTRL, MOD_CTRL),
+            (KEY_LEFTALT, MOD_ALT),
+            (KEY_RIGHTALT, MOD_ALT),
+            (KEY_LEFTMETA, MOD_SUPER),
+            (KEY_RIGHTMETA, MOD_SUPER),
+        ];
+
+        for (keycode, bit) in cases {
+            let mut tracker = ModifierTracker::default();
+            tracker.on_key(keycode, true);
+            assert_eq!(tracker.mask(), bit, "keycode {keycode}");
+            tracker.on_key(keycode, false);
+            assert_eq!(tracker.mask(), 0, "keycode {keycode}");
+        }
+    }
+
+    #[test]
+    fn combined_modifiers_accumulate() {
+        let mut tracker = ModifierTracker::default();
+        tracker.on_key(KEY_LEFTCTRL, true);
+        tracker.on_key(KEY_LEFTALT, true);
+        assert_eq!(tracker.mask(), MOD_CTRL | MOD_ALT);
+
+        tracker.on_key(KEY_LEFTALT, false);
+        assert_eq!(tracker.mask(), MOD_CTRL);
+    }
+
+    #[test]
+    fn releasing_one_of_two_shifts_keeps_bit_set() {
+        let mut tracker = ModifierTracker::default();
+        tracker.on_key(KEY_LEFTSHIFT, true);
+        tracker.on_key(KEY_RIGHTSHIFT, true);
+        assert_eq!(tracker.mask(), MOD_SHIFT);
+
+        // Left released while right is still held: Shift stays active.
+        tracker.on_key(KEY_LEFTSHIFT, false);
+        assert_eq!(tracker.mask(), MOD_SHIFT);
+
+        tracker.on_key(KEY_RIGHTSHIFT, false);
+        assert_eq!(tracker.mask(), 0);
+    }
+
+    #[test]
+    fn non_modifier_keys_are_ignored() {
+        let mut tracker = ModifierTracker::default();
+        tracker.on_key(crate::wm::floating::KEY_TAB, true);
+        tracker.on_key(crate::wm::floating::KEY_F4, true);
+        assert_eq!(tracker.mask(), 0);
+    }
+
+    #[test]
+    fn reset_clears_held_modifiers() {
+        let mut tracker = ModifierTracker::default();
+        tracker.on_key(KEY_LEFTMETA, true);
+        tracker.on_key(KEY_LEFTSHIFT, true);
+        assert_ne!(tracker.mask(), 0);
+
+        tracker.reset();
+        assert_eq!(tracker.mask(), 0);
     }
 }
