@@ -12,18 +12,28 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     output::Output,
-    reexports::wayland_server::Display,
+    reexports::wayland_server::{Display, DisplayHandle},
     utils::{Clock, Monotonic, SERIAL_COUNTER},
     wayland::{
         compositor::CompositorState,
         output::OutputManagerState,
-        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
+        selection::{
+            data_device::{
+                DataDeviceState, request_data_device_client_selection, set_data_device_selection,
+            },
+            primary_selection::PrimarySelectionState,
+        },
         shell::xdg::{XdgShellState, decoration::XdgDecorationState},
         shm::ShmState,
     },
 };
-use tracing::info;
-use wayray_protocol::messages::InputMessage;
+use tracing::{debug, info, warn};
+use wayray_protocol::messages::{
+    ClipboardData, ClipboardOffer, ControlMessage, InputMessage, cap_clipboard_payload,
+    clipboard_offer_mimes, preferred_mime_type,
+};
+
+use crate::network::CompositorToNet;
 
 use crate::wm::{self, WmState};
 
@@ -54,6 +64,19 @@ pub struct WayRay {
     /// "pressed" into the resumed session. We track held keys here and release
     /// them on disconnect so a (re)connecting client always starts clean.
     pressed_keys: std::collections::HashSet<u32>,
+    /// Channel to the network thread for forwarding clipboard control
+    /// messages to the connected remote client. `None` when the backend has
+    /// no network path (e.g. the winit development backend).
+    pub clipboard_tx: Option<std::sync::mpsc::Sender<CompositorToNet>>,
+    /// Mime types of a selection freshly set by a Wayland client, awaiting a
+    /// read on the next event-loop turn. Deferred because Smithay invokes
+    /// `SelectionHandler::new_selection` *before* the seat's selection state
+    /// is updated, so the data cannot be requested from within the handler.
+    pub pending_selection: Option<Vec<String>>,
+    /// Clipboard payload received from the remote client, re-offered to
+    /// Wayland apps as the compositor-side selection. Served byte-for-byte to
+    /// any of the advertised text flavors in `send_selection`.
+    pub remote_clipboard: Option<(String, Vec<u8>)>,
     // Kept alive to maintain their Wayland globals — not accessed directly.
     _output_manager_state: OutputManagerState,
     _xdg_decoration_state: XdgDecorationState,
@@ -101,6 +124,9 @@ impl WayRay {
             window_ids: Vec::new(),
             next_window_id: 1,
             pressed_keys: std::collections::HashSet::new(),
+            clipboard_tx: None,
+            pending_selection: None,
+            remote_clipboard: None,
             _output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
             _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
         }
@@ -327,6 +353,75 @@ impl WayRay {
         }
     }
 
+    /// Forward a Wayland-app selection to the remote client (server → client
+    /// clipboard sync). Called once per event-loop turn by the backend, after
+    /// client dispatch — by then the seat's selection state reflects the
+    /// `new_selection` that queued `pending_selection`.
+    ///
+    /// The selection payload is read from the data-source fd on a short-lived
+    /// bounded reader thread (a Wayland client controls when — and whether —
+    /// it writes, so the compositor thread must never block on the pipe) and
+    /// then sent to the network thread over the compositor→net channel.
+    pub fn process_pending_clipboard(&mut self) {
+        let Some(mime_types) = self.pending_selection.take() else {
+            return;
+        };
+        let Some(tx) = self.clipboard_tx.clone() else {
+            return; // no network path (winit dev backend)
+        };
+        let Some(mime_type) = preferred_mime_type(&mime_types).map(str::to_string) else {
+            debug!("selection offers no mime types; nothing to forward");
+            return;
+        };
+
+        let (reader, writer) = match std::io::pipe() {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(error = %e, "failed to create clipboard pipe");
+                return;
+            }
+        };
+
+        if let Err(e) = request_data_device_client_selection::<Self>(
+            &self.seat,
+            mime_type.clone(),
+            writer.into(),
+        ) {
+            // E.g. the selection was replaced by a compositor-side one in the
+            // meantime — nothing to forward.
+            debug!(error = %e, "could not request selection contents");
+            return;
+        }
+
+        std::thread::Builder::new()
+            .name("wayray-clipboard-read".into())
+            .spawn(move || read_selection_and_forward(reader, mime_type, mime_types, tx))
+            .map_err(|e| warn!(error = %e, "failed to spawn clipboard reader thread"))
+            .ok();
+    }
+
+    /// Re-offer clipboard data received from the remote client as the Wayland
+    /// selection, so applications in the session can paste it. The payload is
+    /// stored on the compositor and served from `send_selection` when an app
+    /// asks for it.
+    pub fn set_remote_clipboard(&mut self, dh: &DisplayHandle, mut clip: ClipboardData) {
+        if cap_clipboard_payload(&mut clip.data, &clip.mime_type) {
+            warn!(
+                mime_type = %clip.mime_type,
+                "remote clipboard payload exceeded the size cap and was truncated"
+            );
+        }
+        let offer_mimes = clipboard_offer_mimes(&clip.mime_type);
+        // Log only metadata: clipboard contents are user data.
+        info!(
+            mime_type = %clip.mime_type,
+            bytes = clip.data.len(),
+            "publishing remote clipboard as Wayland selection"
+        );
+        self.remote_clipboard = Some((clip.mime_type, clip.data));
+        set_data_device_selection(dh, &self.seat, offer_mimes, ());
+    }
+
     /// Inject an input event received from a network client into the
     /// compositor's seat, following the same patterns as `process_input_event`.
     pub fn inject_network_input(&mut self, msg: InputMessage) {
@@ -475,5 +570,60 @@ impl WayRay {
                 pointer.frame(self);
             }
         }
+    }
+}
+
+/// Read a selection payload from the data-source pipe (bounded by the
+/// protocol clipboard cap) and forward it to the network thread as a
+/// `ClipboardOffer` + `ClipboardData` pair. Runs on a dedicated short-lived
+/// thread; the read ends when the source finishes writing and closes its end
+/// of the pipe (or once the cap is exceeded).
+fn read_selection_and_forward(
+    mut reader: std::io::PipeReader,
+    mime_type: String,
+    offered_mime_types: Vec<String>,
+    tx: std::sync::mpsc::Sender<CompositorToNet>,
+) {
+    use std::io::Read;
+    use wayray_protocol::messages::MAX_CLIPBOARD_DATA;
+
+    // Read at most cap + 1 bytes: the extra byte tells truncation from an
+    // exactly-cap-sized payload. Dropping the reader early closes the pipe,
+    // so an oversized source gets EPIPE instead of filling the kernel buffer.
+    let mut data = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    while data.len() <= MAX_CLIPBOARD_DATA {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                debug!(error = %e, "clipboard pipe read failed");
+                return;
+            }
+        }
+    }
+
+    if data.is_empty() {
+        debug!("selection source wrote no data; nothing to forward");
+        return;
+    }
+    if cap_clipboard_payload(&mut data, &mime_type) {
+        warn!(
+            mime_type = %mime_type,
+            "selection exceeded the clipboard size cap and was truncated"
+        );
+    }
+
+    // Contents are user data — log only metadata.
+    debug!(mime_type = %mime_type, bytes = data.len(), "forwarding selection to client");
+    let offer = ControlMessage::ClipboardOffer(ClipboardOffer {
+        mime_types: offered_mime_types,
+    });
+    let payload = ControlMessage::ClipboardData(ClipboardData { mime_type, data });
+    if tx.send(CompositorToNet::SendControl(offer)).is_err()
+        || tx.send(CompositorToNet::SendControl(payload)).is_err()
+    {
+        debug!("network thread gone; clipboard forward dropped");
     }
 }
