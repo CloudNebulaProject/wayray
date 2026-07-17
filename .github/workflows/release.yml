@@ -97,17 +97,19 @@ jobs:
           prepare: |
             set -x
             pkg publisher || true
-            # Show what's actually available so failures are diagnosable from logs.
-            pkg list -a | egrep -i 'wayland|pixman|xkbcommon|gcc-14|gcc-13|pkg-config' || true
-            pkg install -v developer/gcc-14 || pkg install -v developer/gcc-13 || true
-            pkg install -v developer/build/pkg-config || true
-            pkg install -v x11/library/libpixman || pkg install -v library/libpixman || true
-            pkg install -v x11/library/libxkbcommon || pkg install -v library/libxkbcommon || true
-            pkg install -v library/wayland || pkg install -v x11/library/wayland || true
+            pkg install -v developer/gcc-14 developer/build/pkg-config || true
+            # No system libwayland needed: the vendored wayland-backend uses its
+            # pure-Rust backend (with the illumos epoll shim). pixman + xkbcommon
+            # are runtime/link deps of the smithay renderer and keyboard handling.
+            pkg install -v library/graphics/pixman x11/library/libxkbcommon || true
+            # rustup-init (and rustc-built binaries) need 64-bit libgcc_s.so.1,
+            # which OpenIndiana ships under /usr/gcc/<ver>/lib/amd64.
+            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:$LD_LIBRARY_PATH"
             curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
           run: |
             set -e
             export PATH="$HOME/.cargo/bin:/usr/gnu/bin:$PATH"
+            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:$LD_LIBRARY_PATH"
             rustc --version
             cargo --version
             cargo build --release --locked \

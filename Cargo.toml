@@ -35,3 +35,9 @@ sea-orm = { version = "1", default-features = false, features = [
     "runtime-tokio-rustls",
     "macros",
 ] }
+
+# wayland-backend 0.3.15 has no illumos support (poller is epoll/kqueue only).
+# Vendored with an illumos epoll shim; see vendor/wayland-backend/WAYRAY-VENDOR.md.
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }
+smithay = { path = "vendor/smithay" }

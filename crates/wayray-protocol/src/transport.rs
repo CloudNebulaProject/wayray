@@ -253,7 +253,7 @@ pub mod doors_transport {
             .call_with_data(&json)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
 
-        serde_json::from_slice(&response_bytes)
+        serde_json::from_slice(response_bytes.data())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -280,9 +280,30 @@ pub mod doors_transport {
 
     /// Server door procedure: decode the request JSON, dispatch to the installed
     /// handler, and return the response JSON (empty when there is no response).
-    #[doors::server_procedure]
-    fn launcher_door(request: doors::server::Request) -> doors::server::Response<Vec<u8>> {
-        let response = serde_json::from_slice::<LauncherRequest>(&request.data)
+    ///
+    /// Written as a raw `door_server_procedure_t` rather than via
+    /// `#[doors::server_procedure]`: the doors 0.8.1 macro expands to code that
+    /// passes `DoorFd` pointers where its own `door_return` binding expects
+    /// `door_desc_t`, so the macro does not compile. `door_return` copies the
+    /// response into the caller before this thread is reused, and never
+    /// returns, so the response `Vec` is leaked — the same documented behavior
+    /// the doors crate's `Response` has for heap data; responses here are small
+    /// and the launcher channel is low-traffic.
+    extern "C" fn launcher_door(
+        _cookie: *const std::os::raw::c_void,
+        argp: *const std::os::raw::c_char,
+        arg_size: usize,
+        _dp: *const doors::illumos::door_h::door_desc_t,
+        _n_desc: std::os::raw::c_uint,
+    ) {
+        let data: &[u8] = if argp.is_null() {
+            &[]
+        } else {
+            // SAFETY: the kernel hands the door server a valid buffer of
+            // arg_size bytes for the duration of this invocation.
+            unsafe { std::slice::from_raw_parts(argp as *const u8, arg_size) }
+        };
+        let response = serde_json::from_slice::<LauncherRequest>(data)
             .ok()
             .and_then(|req| {
                 HANDLER
@@ -293,7 +314,16 @@ pub mod doors_transport {
         let bytes = response
             .and_then(|r| serde_json::to_vec(&r).ok())
             .unwrap_or_default();
-        doors::server::Response::new(bytes)
+        // SAFETY: bytes outlives the call; door_return copies it out and does
+        // not return.
+        unsafe {
+            doors::illumos::door_h::door_return(
+                bytes.as_ptr() as *const std::os::raw::c_char,
+                bytes.len(),
+                std::ptr::null(),
+                0,
+            )
+        }
     }
 
     /// Install a door at `path` serving `handler`, then block forever while the
