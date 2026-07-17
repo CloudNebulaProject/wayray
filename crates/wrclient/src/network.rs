@@ -15,13 +15,87 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
+use miette::Diagnostic;
+use thiserror::Error;
 use tracing::info;
 use wayray_protocol::codec;
 use wayray_protocol::messages::{
-    ClientHello, ControlMessage, DisplayMessage, InputMessage, ServerHello,
+    AudioMessage, ClientHello, ControlMessage, DisplayMessage, InputMessage, ServerHello,
 };
 pub use wayray_protocol::tls::PinStore;
 use wayray_protocol::tls::verifier::{PinPolicy, PinnedServerCertVerifier};
+
+/// Errors from a connection attempt, surfaced as miette diagnostics so the
+/// user gets an explanation and a fix hint instead of a hang or a bare EOF.
+#[derive(Debug, Error, Diagnostic)]
+pub enum ConnectError {
+    /// The server refused us with a typed `ProtocolError` (e.g. our protocol
+    /// version is outside its supported range). Not retryable.
+    #[error("server rejected the connection: {reason}")]
+    #[diagnostic(
+        code(wrclient::network::rejected),
+        help(
+            "this client speaks WayRay protocol version {client_version}; \
+             upgrade whichever side is older so the versions overlap"
+        )
+    )]
+    Rejected {
+        /// Human-readable reason sent by the server.
+        reason: String,
+        /// This client's protocol version, for the help text.
+        client_version: u32,
+    },
+
+    /// The server's `ServerHello` advertises a protocol version this client
+    /// cannot speak. Not retryable.
+    #[error(
+        "server speaks protocol version {server_version}, but this client supports {min}..={max}"
+    )]
+    #[diagnostic(
+        code(wrclient::network::incompatible_server),
+        help("upgrade whichever side is older so the protocol versions overlap")
+    )]
+    IncompatibleServer {
+        server_version: u32,
+        min: u32,
+        max: u32,
+    },
+
+    /// The handshake derailed: the server answered with something other than
+    /// `ServerHello`, `SessionRedirect`, or a typed rejection.
+    #[error("unexpected message during handshake: {got}")]
+    #[diagnostic(code(wrclient::network::handshake))]
+    UnexpectedMessage { got: String },
+
+    /// Transport-level failure (connect, TLS/pinning, stream I/O). Retryable.
+    #[error("connection failed: {0}")]
+    #[diagnostic(
+        code(wrclient::network::transport),
+        help(
+            "check that wrsrvd is running and reachable, and that the pinned \
+             server certificate still matches"
+        )
+    )]
+    Transport(String),
+}
+
+impl ConnectError {
+    fn transport(e: impl std::fmt::Display) -> Self {
+        Self::Transport(e.to_string())
+    }
+
+    /// Whether retrying the same server with the same parameters can ever
+    /// succeed. Typed rejections are policy, not weather — retrying would
+    /// just hammer the server with doomed handshakes.
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::Rejected { .. }
+                | Self::IncompatibleServer { .. }
+                | Self::UnexpectedMessage { .. }
+        )
+    }
+}
 
 /// Configuration for the QUIC client connection.
 pub struct ClientConfig {
@@ -93,8 +167,9 @@ pub struct ServerConnection {
     pub connection: quinn::Connection,
     /// Bidirectional control stream -- send side.
     pub control_send: quinn::SendStream,
-    /// Bidirectional control stream -- receive side.
-    pub control_recv: quinn::RecvStream,
+    /// Bidirectional control stream -- receive side. `None` once handed to a
+    /// dedicated control-reader task via [`Self::take_control_recv`].
+    pub control_recv: Option<quinn::RecvStream>,
     /// Unidirectional input stream to server (send only).
     pub input_send: quinn::SendStream,
     /// The server hello received during handshake.
@@ -137,9 +212,28 @@ impl ServerConnection {
         Ok(recv)
     }
 
-    /// Read the next control message from the server.
+    /// Read the next control message from the server. Errors if the receive
+    /// side was moved to a control-reader task via [`Self::take_control_recv`].
     pub async fn recv_control(&mut self) -> Result<ControlMessage, Box<dyn std::error::Error>> {
-        read_message(&mut self.control_recv).await
+        match self.control_recv.as_mut() {
+            Some(recv) => read_message(recv).await,
+            None => Err("control receive stream was moved to the reader task".into()),
+        }
+    }
+
+    /// Move the control receive stream out, so a dedicated task can own the
+    /// blocking read loop (a length-prefixed read is not cancellation-safe, so
+    /// it must not be raced against a timeout in a select loop).
+    pub fn take_control_recv(&mut self) -> Option<quinn::RecvStream> {
+        self.control_recv.take()
+    }
+
+    /// Send an arbitrary control message to the server (e.g. clipboard sync).
+    pub async fn send_control(
+        &mut self,
+        msg: &ControlMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        write_message(&mut self.control_send, msg).await
     }
 
     /// Send a pong response.
@@ -184,21 +278,31 @@ fn build_client_config(config: &ClientConfig) -> quinn::ClientConfig {
 ///
 /// The caller must keep the returned `quinn::Endpoint` alive for the
 /// duration of the connection.
-pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn std::error::Error>> {
+pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, ConnectError> {
     let client_config = build_client_config(config);
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
+    let mut endpoint = quinn::Endpoint::client(
+        "0.0.0.0:0"
+            .parse::<SocketAddr>()
+            .map_err(ConnectError::transport)?,
+    )
+    .map_err(ConnectError::transport)?;
     endpoint.set_default_client_config(client_config);
 
     info!(server = %config.server_addr, "connecting to wrsrvd");
     let connection = endpoint
-        .connect(config.server_addr, &config.server_name)?
-        .await?;
+        .connect(config.server_addr, &config.server_name)
+        .map_err(ConnectError::transport)?
+        .await
+        .map_err(ConnectError::transport)?;
     info!("QUIC connection established");
 
     // Open control stream (bidirectional) and immediately send ClientHello.
     // Writing data triggers the server's accept_bi().
-    let (mut control_send, mut control_recv) = connection.open_bi().await?;
+    let (mut control_send, mut control_recv) = connection
+        .open_bi()
+        .await
+        .map_err(ConnectError::transport)?;
     info!("control stream opened");
 
     let client_hello = ControlMessage::ClientHello(ClientHello {
@@ -206,12 +310,17 @@ pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn st
         capabilities: config.capabilities.clone(),
         token: config.token.clone(),
     });
-    write_message(&mut control_send, &client_hello).await?;
+    write_message(&mut control_send, &client_hello)
+        .await
+        .map_err(ConnectError::transport)?;
     info!("sent ClientHello");
 
-    // Read the server's response: ServerHello (accepted) or SessionRedirect
-    // (our session lives elsewhere / load balancing).
-    let response: ControlMessage = read_message(&mut control_recv).await?;
+    // Read the server's response: ServerHello (accepted), SessionRedirect
+    // (our session lives elsewhere / load balancing), or ProtocolError (the
+    // server refused us — e.g. a protocol version mismatch).
+    let response: ControlMessage = read_message(&mut control_recv)
+        .await
+        .map_err(ConnectError::transport)?;
     let server_hello = match response {
         ControlMessage::ServerHello(hello) => {
             // The token is a session credential — never log it in the clear.
@@ -223,20 +332,38 @@ pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn st
                 resumed = hello.resumed,
                 "received ServerHello"
             );
+            if !wayray_protocol::version_compatible(hello.version) {
+                return Err(ConnectError::IncompatibleServer {
+                    server_version: hello.version,
+                    min: wayray_protocol::MIN_PROTOCOL_VERSION,
+                    max: wayray_protocol::PROTOCOL_VERSION,
+                });
+            }
             hello
         }
         ControlMessage::SessionRedirect { server_id, addr } => {
             info!(%server_id, %addr, "server redirected us to a peer");
             return Ok(ConnectOutcome::Redirect { server_id, addr });
         }
+        ControlMessage::ProtocolError(err) => {
+            return Err(ConnectError::Rejected {
+                reason: err.reason,
+                client_version: wayray_protocol::PROTOCOL_VERSION,
+            });
+        }
         other => {
-            return Err(format!("expected ServerHello, got {other:?}").into());
+            return Err(ConnectError::UnexpectedMessage {
+                got: format!("{other:?}"),
+            });
         }
     };
 
     // Open input stream (unidirectional to server).
     // Data written later via send_input() triggers the server's accept_uni().
-    let input_send = connection.open_uni().await?;
+    let input_send = connection
+        .open_uni()
+        .await
+        .map_err(ConnectError::transport)?;
     info!("input stream opened");
 
     Ok(ConnectOutcome::Connected(
@@ -244,7 +371,7 @@ pub async fn connect(config: &ClientConfig) -> Result<ConnectOutcome, Box<dyn st
         ServerConnection {
             connection,
             control_send,
-            control_recv,
+            control_recv: Some(control_recv),
             input_send,
             server_hello,
         },
@@ -258,6 +385,8 @@ async fn read_message<T: serde::de::DeserializeOwned>(
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    // Never trust the wire: cap before allocating.
+    codec::check_message_size(len)?;
 
     let mut payload = vec![0u8; len];
     recv.read_exact(&mut payload).await?;
@@ -280,6 +409,22 @@ async fn write_message<T: serde::Serialize>(
 pub async fn read_display_message(
     recv: &mut quinn::RecvStream,
 ) -> Result<DisplayMessage, Box<dyn std::error::Error>> {
+    read_message(recv).await
+}
+
+/// Read a control message from a (moved-out) control receive stream. Used by
+/// the dedicated control-reader task.
+pub async fn read_control_message(
+    recv: &mut quinn::RecvStream,
+) -> Result<ControlMessage, Box<dyn std::error::Error>> {
+    read_message(recv).await
+}
+
+/// Read an audio message from the dedicated audio stream (the only
+/// server-initiated bidirectional stream).
+pub async fn read_audio_message(
+    recv: &mut quinn::RecvStream,
+) -> Result<AudioMessage, Box<dyn std::error::Error>> {
     read_message(recv).await
 }
 
@@ -449,6 +594,64 @@ mod tests {
         let frame = read_display_message(&mut display_recv).await.unwrap();
         let DisplayMessage::FrameUpdate(update) = frame;
         assert_eq!(update.sequence, 7);
+
+        server.await.unwrap();
+    }
+
+    /// A server that rejects the handshake with a typed `ProtocolError` (e.g.
+    /// version mismatch) surfaces as a fatal `ConnectError::Rejected` miette
+    /// diagnostic carrying the server's reason — not a hang or a bare EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_rejection_surfaces_clean_diagnostic() {
+        let (endpoint, addr) = start_test_server().await;
+
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let (mut control_send, mut control_recv) = connection.accept_bi().await.unwrap();
+            let _: ControlMessage = read_message(&mut control_recv).await.unwrap();
+
+            let reject = ControlMessage::ProtocolError(wayray_protocol::messages::ProtocolError {
+                code: wayray_protocol::messages::ProtocolErrorCode::VersionMismatch,
+                reason: "client protocol version 2 is not supported by this server".to_string(),
+            });
+            write_message(&mut control_send, &reject).await.unwrap();
+            let _ = control_send.finish();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            endpoint.close(
+                wayray_protocol::close_codes::VERSION_MISMATCH.into(),
+                b"version mismatch",
+            );
+        });
+
+        let config = ClientConfig {
+            server_addr: addr,
+            server_name: "localhost".to_string(),
+            capabilities: vec![],
+            token: None,
+            expected_fingerprint: None,
+            pin_store: temp_pin_store("reject"),
+        };
+
+        let err = match connect(&config).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected a rejection error"),
+        };
+        match &err {
+            ConnectError::Rejected {
+                reason,
+                client_version,
+            } => {
+                assert!(reason.contains("not supported"));
+                assert_eq!(*client_version, wayray_protocol::PROTOCOL_VERSION);
+            }
+            other => panic!("expected ConnectError::Rejected, got {other:?}"),
+        }
+        // Rejections are policy: the reconnect loop must not spin on them.
+        assert!(err.is_fatal());
+        // And it renders as a diagnostic with the reason visible.
+        let rendered = format!("{:?}", miette::Report::new(err));
+        assert!(rendered.contains("not supported"));
 
         server.await.unwrap();
     }
