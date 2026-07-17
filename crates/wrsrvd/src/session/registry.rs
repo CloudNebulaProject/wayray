@@ -1,8 +1,11 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{info, warn};
 
+use super::persistence::{NullStore, SessionStore};
 use super::types::{Session, SessionId, SessionState, SessionToken, SessionTransitionError};
 use wayray_protocol::cluster::DEFAULT_CAPACITY;
 
@@ -53,6 +56,10 @@ pub struct SessionRegistry {
     remote_sessions: HashMap<SessionToken, RemoteEntry>,
     /// Maximum number of sessions this server will host (for load factor).
     capacity: u32,
+    /// Durable backing store, written on every state change. The default
+    /// [`NullStore`] keeps sessions in memory only (lost on restart); see
+    /// [`super::persistence`] for the SQLite store and restore semantics.
+    store: Arc<dyn SessionStore>,
 }
 
 impl SessionRegistry {
@@ -64,7 +71,104 @@ impl SessionRegistry {
             local_server_id: String::new(),
             remote_sessions: HashMap::new(),
             capacity: DEFAULT_CAPACITY,
+            store: Arc::new(NullStore),
         }
+    }
+
+    /// Attach a persistent session store. Subsequent state changes are
+    /// written through to it; call [`Self::restore_persisted`] afterwards to
+    /// load previously persisted sessions.
+    pub fn with_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Enable SQLite persistence at `path` and restore previously persisted
+    /// sessions (see [`super::persistence`] for the restore semantics).
+    ///
+    /// A store that fails to open is logged loudly and the registry keeps
+    /// running in memory: session durability degrades, but the server stays
+    /// available.
+    pub fn enable_persistence(&mut self, path: &Path) {
+        match super::persistence::open_store(path) {
+            Ok(store) => {
+                self.store = store;
+                let restored = self.restore_persisted();
+                info!(
+                    path = %path.display(),
+                    restored,
+                    "session persistence enabled"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to open session state database; \
+                     continuing in-memory — sessions will NOT survive a restart"
+                );
+            }
+        }
+    }
+
+    /// Load persisted sessions from the attached store into the registry.
+    /// Returns the number of sessions restored.
+    ///
+    /// A restarted server has no live surfaces, so `Active` and `Suspended`
+    /// rows are both restored as `Suspended`: the token → session identity
+    /// binding (id, token, user, home server, timeout) survives, and a
+    /// returning client's token resumes into a session with the same
+    /// identity. The suspend clock restarts at boot. `Creating`/`Destroyed`
+    /// rows never represent a resumable desktop and are deleted.
+    pub fn restore_persisted(&mut self) -> usize {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut restored = 0;
+
+        for row in self.store.load_all() {
+            let id = SessionId::from_raw(row.id);
+            // Never reuse a previously issued id, even for rows that are
+            // dropped below — a stale reference to an old id must not alias a
+            // fresh session.
+            self.next_id = self.next_id.max(row.id + 1);
+            match row.state {
+                SessionState::Active | SessionState::Suspended => {
+                    // Best-effort monotonic reconstruction of the wall-clock
+                    // creation time (informational only).
+                    let age = Duration::from_secs(
+                        now_epoch.saturating_sub(row.created_at_epoch).max(0) as u64,
+                    );
+                    let session = Session {
+                        id,
+                        token: SessionToken::new(row.token),
+                        state: SessionState::Suspended,
+                        created_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+                        suspended_at: Some(Instant::now()),
+                        suspend_timeout: row.suspend_timeout,
+                        user: row.user,
+                        home_server: row.home_server,
+                    };
+                    info!(
+                        %id,
+                        user = session.user.as_deref().unwrap_or("<unauthenticated>"),
+                        "restored persisted session as suspended (awaiting token reconnect)"
+                    );
+                    // Write back the (possibly Active → Suspended) state so
+                    // the store matches memory.
+                    self.store.persist(&session);
+                    self.token_index.insert(session.token.clone(), id);
+                    self.sessions.insert(id, session);
+                    restored += 1;
+                }
+                SessionState::Creating | SessionState::Destroyed => {
+                    info!(%id, state = %row.state, "dropping non-resumable persisted session");
+                    self.store.remove(id);
+                }
+            }
+        }
+        restored
     }
 
     /// Create a registry with an explicit local server id and capacity.
@@ -134,6 +238,7 @@ impl SessionRegistry {
         self.next_id += 1;
 
         let session = Session::new(id, token.clone(), self.local_server_id.clone());
+        self.store.persist(&session);
         // A token we now host locally is no longer "remote".
         self.remote_sessions.remove(&token);
         self.token_index.insert(token.clone(), id);
@@ -187,9 +292,13 @@ impl SessionRegistry {
         session.transition(next)?;
         info!(%id, %from, %next, "session state transition");
 
-        // Clean up destroyed sessions from the index.
+        // Clean up destroyed sessions from the index and the store; persist
+        // every other transition so it survives a restart.
         if next == SessionState::Destroyed {
             self.token_index.remove(&session.token);
+            self.store.remove(id);
+        } else {
+            self.store.persist(session);
         }
 
         Ok(())
@@ -214,6 +323,15 @@ impl SessionRegistry {
     pub fn set_user(&mut self, id: SessionId, user: String) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.user = Some(user);
+            self.store.persist(session);
+        }
+    }
+
+    /// Set the suspend timeout for a session.
+    pub fn set_suspend_timeout(&mut self, id: SessionId, timeout: Duration) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.suspend_timeout = timeout;
+            self.store.persist(session);
         }
     }
 
@@ -262,6 +380,76 @@ impl SessionRegistry {
     /// Count sessions by state.
     pub fn count_by_state(&self, state: SessionState) -> usize {
         self.sessions.values().filter(|s| s.state == state).count()
+    }
+
+    /// Session counts broken down by state, for admin `ServerStatus` queries.
+    pub fn state_counts(&self) -> wayray_protocol::admin::SessionCounts {
+        let mut counts = wayray_protocol::admin::SessionCounts::default();
+        for session in self.sessions.values() {
+            match session.state {
+                SessionState::Creating => counts.creating += 1,
+                SessionState::Active => counts.active += 1,
+                SessionState::Suspended => counts.suspended += 1,
+                SessionState::Destroyed => counts.destroyed += 1,
+            }
+        }
+        counts
+    }
+
+    /// Read-only snapshot of every session for admin `ListSessions` queries,
+    /// sorted by id. Tokens are redacted to a prefix — the full token is a
+    /// bearer credential and never leaves the compositor via this channel.
+    ///
+    /// `connected_client` attaches the remote endpoint address to the session
+    /// currently bound to the connected client (if any).
+    pub fn admin_snapshot(
+        &self,
+        connected_client: Option<(SessionId, Option<&str>)>,
+    ) -> Vec<wayray_protocol::admin::SessionEntry> {
+        use std::time::SystemTime;
+        use wayray_protocol::admin::{SessionEntry, redact_token};
+
+        let now_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut entries: Vec<SessionEntry> = self
+            .sessions
+            .values()
+            .map(|s| {
+                let uptime_secs = s.created_at.elapsed().as_secs();
+                // Instants are monotonic, not wall-clock; approximate wall
+                // times by subtracting monotonic ages from "now".
+                let created_at_epoch_secs = now_epoch.saturating_sub(uptime_secs);
+                let last_active_epoch_secs = match s.state {
+                    // An active session is active right now.
+                    SessionState::Active => now_epoch,
+                    // A suspended session was last active when it suspended.
+                    SessionState::Suspended | SessionState::Destroyed => s
+                        .suspended_at
+                        .map(|t| now_epoch.saturating_sub(t.elapsed().as_secs()))
+                        .unwrap_or(created_at_epoch_secs),
+                    SessionState::Creating => created_at_epoch_secs,
+                };
+                let client_addr = match connected_client {
+                    Some((id, addr)) if id == s.id => addr.map(str::to_string),
+                    _ => None,
+                };
+                SessionEntry {
+                    id: s.id.raw(),
+                    token_prefix: redact_token(s.token.as_str()),
+                    user: s.user.clone(),
+                    state: s.state.to_string(),
+                    created_at_epoch_secs,
+                    last_active_epoch_secs,
+                    uptime_secs,
+                    client_addr,
+                }
+            })
+            .collect();
+        entries.sort_by_key(|e| e.id);
+        entries
     }
 }
 
@@ -479,6 +667,56 @@ mod tests {
         reg.destroy(active).unwrap();
         let tokens = reg.resumable_tokens();
         assert_eq!(tokens, vec!["suspended-tok".to_string()]);
+    }
+
+    #[test]
+    fn admin_snapshot_redacts_tokens_and_attaches_client() {
+        let mut reg = SessionRegistry::new();
+        let active = reg.create_session(SessionToken::new("0123456789abcdef"));
+        let suspended = reg.create_session(SessionToken::new("fedcba9876543210"));
+        reg.activate(active).unwrap();
+        reg.activate(suspended).unwrap();
+        reg.suspend(suspended).unwrap();
+        reg.set_user(active, "alice".to_string());
+
+        let snapshot = reg.admin_snapshot(Some((active, Some("192.0.2.9:5000"))));
+        assert_eq!(snapshot.len(), 2);
+
+        // Sorted by id; the first is the active session.
+        let a = &snapshot[0];
+        assert_eq!(a.id, active.raw());
+        assert_eq!(a.state, "active");
+        assert_eq!(a.user.as_deref(), Some("alice"));
+        assert_eq!(a.client_addr.as_deref(), Some("192.0.2.9:5000"));
+        // The full token must never appear; only a redacted prefix.
+        assert_eq!(a.token_prefix, "01234567\u{2026}");
+        assert!(!a.token_prefix.contains("89abcdef"));
+
+        let s = &snapshot[1];
+        assert_eq!(s.state, "suspended");
+        assert_eq!(s.client_addr, None);
+        assert!(s.last_active_epoch_secs >= s.created_at_epoch_secs);
+
+        // Without a connected client, no entry carries an address.
+        let snapshot = reg.admin_snapshot(None);
+        assert!(snapshot.iter().all(|e| e.client_addr.is_none()));
+    }
+
+    #[test]
+    fn state_counts_by_state() {
+        let mut reg = SessionRegistry::new();
+        let a = reg.create_session(SessionToken::new("a"));
+        let b = reg.create_session(SessionToken::new("b"));
+        let _c = reg.create_session(SessionToken::new("c"));
+        reg.activate(a).unwrap();
+        reg.activate(b).unwrap();
+        reg.suspend(b).unwrap();
+
+        let counts = reg.state_counts();
+        assert_eq!(counts.creating, 1);
+        assert_eq!(counts.active, 1);
+        assert_eq!(counts.suspended, 1);
+        assert_eq!(counts.destroyed, 0);
     }
 
     #[test]

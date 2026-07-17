@@ -17,7 +17,7 @@ use wayray_wm_protocol::server::{
     wayray_wm_workspace_v1::{self, WayrayWmWorkspaceV1},
 };
 
-use super::types::{DecorationMode, RenderCommand, WindowId, WorkspaceState, ZOrder};
+use super::types::{BorderSpec, DecorationMode, RenderCommand, WindowId, WorkspaceState, ZOrder};
 
 /// Window info tuple for sending to a newly connected WM.
 /// (window_id, title, app_id, width, height)
@@ -64,6 +64,8 @@ pub struct WmProtocolState {
     /// The bound workspace-manager resource, used to emit create/destroy
     /// events and to resend the full workspace list on reconnect.
     workspace_manager: Option<WayrayWmWorkspaceV1>,
+    /// Per-window server-side border specs set via `set_borders`.
+    borders: HashMap<WindowId, BorderSpec>,
 }
 
 impl std::fmt::Debug for WmProtocolState {
@@ -103,6 +105,7 @@ impl WmProtocolState {
             wm_seat: None,
             workspace: WorkspaceState::default(),
             workspace_manager: None,
+            borders: HashMap::new(),
         }
     }
 
@@ -121,6 +124,12 @@ impl WmProtocolState {
     /// windows before mapping them into the Space.
     pub fn workspace_visible(&self, id: WindowId, output: &str) -> bool {
         self.workspace.is_visible(id, output)
+    }
+
+    /// Per-window server-side border specs set by the WM via `set_borders`.
+    /// Used by the render path to draw border rectangles around windows.
+    pub fn borders(&self) -> &HashMap<WindowId, BorderSpec> {
+        &self.borders
     }
 
     /// Send a `window_new` event to the connected WM for a new toplevel.
@@ -169,6 +178,8 @@ impl WmProtocolState {
 
     /// Send a `window_closed` event to the connected WM.
     pub fn notify_window_closed(&mut self, window_id: WindowId) {
+        self.borders.remove(&window_id);
+
         let Some(manager) = &self.wm_client else {
             return;
         };
@@ -292,6 +303,10 @@ pub trait WmProtocolHandler:
     /// Each tuple is (window_id, title, app_id, width, height).
     fn existing_windows(&self) -> Vec<WindowSnapshot>;
 
+    /// Return the list of available outputs for sending to a newly connected
+    /// WM. Each tuple is (output_name, width, height).
+    fn outputs(&self) -> Vec<(String, i32, i32)>;
+
     // -- Compositor actions: let protocol dispatch reach back into Smithay --
 
     /// Send a configure with proposed dimensions to the window's toplevel.
@@ -323,8 +338,9 @@ impl<D: WmProtocolHandler> GlobalDispatch<WayrayWmManagerV1, WmGlobalData, D> fo
     ) {
         let instance = data_init.init(resource, ());
 
-        // Collect existing windows before mutating protocol state.
+        // Collect existing windows and outputs before mutating protocol state.
         let existing = state.existing_windows();
+        let outputs = state.outputs();
 
         let proto = state.wm_protocol_state();
 
@@ -332,10 +348,17 @@ impl<D: WmProtocolHandler> GlobalDispatch<WayrayWmManagerV1, WmGlobalData, D> fo
         if let Some(old_manager) = proto.wm_client.take() {
             old_manager.replaced();
             proto.window_objects.clear();
+            proto.borders.clear();
             info!("external WM replaced by new connection");
         }
 
         proto.wm_client = Some(instance.clone());
+
+        // Advertise the available outputs so the WM can place windows
+        // (a single virtual output today; more once multi-output lands).
+        for (output_name, width, height) in outputs {
+            instance.output_new(output_name, width, height);
+        }
 
         // Send the full window list so the new WM can reconstruct state.
         if !existing.is_empty() {
@@ -398,6 +421,7 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmManagerV1, (), D> for WmProtocolStat
             proto.keybindings.clear();
             proto.wm_seat = None;
             proto.active_mode.clear();
+            proto.borders.clear();
             info!("external WM disconnected");
         }
     }
@@ -527,15 +551,65 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
                     });
                 }
             }
-            wayray_wm_window_v1::Request::SetZAbove { .. }
-            | wayray_wm_window_v1::Request::SetZBelow { .. } => {
-                // TODO: relative z-ordering (needs sibling window lookup)
+            wayray_wm_window_v1::Request::SetZAbove { sibling } => {
+                let Some(sibling_id) = proto.window_id_for_resource(&sibling) else {
+                    warn!("set_z_above for unknown sibling resource");
+                    return;
+                };
+                if let Some(cmd) = proto
+                    .pending_render_commands
+                    .iter_mut()
+                    .find(|c| c.id == window_id)
+                {
+                    cmd.z_order = ZOrder::Above(sibling_id);
+                } else {
+                    proto.pending_render_commands.push(RenderCommand {
+                        id: window_id,
+                        position: (0, 0),
+                        z_order: ZOrder::Above(sibling_id),
+                        visible: true,
+                    });
+                }
             }
-            wayray_wm_window_v1::Request::SetBorders { .. } => {
-                // TODO: border rendering
+            wayray_wm_window_v1::Request::SetZBelow { sibling } => {
+                let Some(sibling_id) = proto.window_id_for_resource(&sibling) else {
+                    warn!("set_z_below for unknown sibling resource");
+                    return;
+                };
+                if let Some(cmd) = proto
+                    .pending_render_commands
+                    .iter_mut()
+                    .find(|c| c.id == window_id)
+                {
+                    cmd.z_order = ZOrder::Below(sibling_id);
+                } else {
+                    proto.pending_render_commands.push(RenderCommand {
+                        id: window_id,
+                        position: (0, 0),
+                        z_order: ZOrder::Below(sibling_id),
+                        visible: true,
+                    });
+                }
             }
-            wayray_wm_window_v1::Request::SetOutput { .. } => {
-                // TODO: multi-output support
+            wayray_wm_window_v1::Request::SetBorders {
+                red,
+                green,
+                blue,
+                alpha,
+                width,
+            } => match BorderSpec::from_protocol(red, green, blue, alpha, width) {
+                Some(spec) => {
+                    info!(window = window_id.raw(), width, "WM set window borders");
+                    proto.borders.insert(window_id, spec);
+                }
+                None => {
+                    // Non-positive width removes the border.
+                    proto.borders.remove(&window_id);
+                }
+            },
+            wayray_wm_window_v1::Request::SetOutput { output_name } => {
+                info!(window = window_id.raw(), output = %output_name, "WM assigned window to output");
+                proto.workspace.set_window_output(window_id, output_name);
             }
             wayray_wm_window_v1::Request::Destroy => {}
             _ => {}
@@ -548,10 +622,9 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWindowV1, WmWindowData, D> for WmPro
         _resource: &WayrayWmWindowV1,
         data: &WmWindowData,
     ) {
-        state
-            .wm_protocol_state()
-            .window_objects
-            .remove(&data.window_id);
+        let proto = state.wm_protocol_state();
+        proto.window_objects.remove(&data.window_id);
+        proto.borders.remove(&data.window_id);
     }
 }
 
@@ -681,7 +754,9 @@ impl<D: WmProtocolHandler> Dispatch<WayrayWmWorkspaceV1, (), D> for WmProtocolSt
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{DEFAULT_OUTPUT, WindowId, WorkspaceState};
+    use super::super::types::{
+        BorderSpec, DEFAULT_OUTPUT, RenderCommand, WindowId, WorkspaceState, ZOrder, restack,
+    };
 
     /// Exercise the same workspace-state transitions the workspace Dispatch arms
     /// perform (create_workspace / assign_window / set_active_workspace), and
@@ -746,5 +821,161 @@ mod tests {
         // Re-assigning a workspace clears the tags.
         ws.assign_window(win1, "a".to_string());
         assert!(!ws.window_tags.contains_key(&win1));
+    }
+
+    /// Build a render command carrying only a z-order directive, as the
+    /// set_z_* dispatch arms do when no set_position preceded them.
+    fn z_cmd(id: WindowId, z_order: ZOrder) -> RenderCommand {
+        RenderCommand {
+            id,
+            position: (0, 0),
+            z_order,
+            visible: true,
+        }
+    }
+
+    #[test]
+    fn restack_above_moves_window_over_sibling() {
+        let (a, b, c) = (
+            WindowId::from_raw(1),
+            WindowId::from_raw(2),
+            WindowId::from_raw(3),
+        );
+
+        // Stack bottom -> top: a, b, c. Place a above b -> b, a, c.
+        let order = restack(&[a, b, c], &[z_cmd(a, ZOrder::Above(b))]);
+        assert_eq!(order, vec![b, a, c]);
+    }
+
+    #[test]
+    fn restack_below_moves_window_under_sibling() {
+        let (a, b, c) = (
+            WindowId::from_raw(1),
+            WindowId::from_raw(2),
+            WindowId::from_raw(3),
+        );
+
+        // Place c below a -> c, a, b.
+        let order = restack(&[a, b, c], &[z_cmd(c, ZOrder::Below(a))]);
+        assert_eq!(order, vec![c, a, b]);
+    }
+
+    #[test]
+    fn restack_top_and_bottom() {
+        let (a, b, c) = (
+            WindowId::from_raw(1),
+            WindowId::from_raw(2),
+            WindowId::from_raw(3),
+        );
+
+        let order = restack(&[a, b, c], &[z_cmd(a, ZOrder::Top)]);
+        assert_eq!(order, vec![b, c, a]);
+
+        let order = restack(&[a, b, c], &[z_cmd(c, ZOrder::Bottom)]);
+        assert_eq!(order, vec![c, a, b]);
+    }
+
+    #[test]
+    fn restack_ignores_unknown_windows_and_siblings() {
+        let (a, b) = (WindowId::from_raw(1), WindowId::from_raw(2));
+        let ghost = WindowId::from_raw(99);
+
+        // Unknown window: no change.
+        let order = restack(&[a, b], &[z_cmd(ghost, ZOrder::Top)]);
+        assert_eq!(order, vec![a, b]);
+
+        // Unknown sibling: the window keeps its position.
+        let order = restack(&[a, b], &[z_cmd(a, ZOrder::Above(ghost))]);
+        assert_eq!(order, vec![a, b]);
+
+        // Window relative to itself: no change.
+        let order = restack(&[a, b], &[z_cmd(b, ZOrder::Above(b))]);
+        assert_eq!(order, vec![a, b]);
+
+        // Preserve: no change.
+        let order = restack(&[a, b], &[z_cmd(a, ZOrder::Preserve)]);
+        assert_eq!(order, vec![a, b]);
+    }
+
+    #[test]
+    fn restack_applies_commands_in_order() {
+        let (a, b, c) = (
+            WindowId::from_raw(1),
+            WindowId::from_raw(2),
+            WindowId::from_raw(3),
+        );
+
+        // First raise a to top, then place b above a: a wins the middle slot.
+        let order = restack(
+            &[a, b, c],
+            &[z_cmd(a, ZOrder::Top), z_cmd(b, ZOrder::Above(a))],
+        );
+        assert_eq!(order, vec![c, a, b]);
+    }
+
+    #[test]
+    fn border_spec_from_protocol_clamps_channels() {
+        let spec = BorderSpec::from_protocol(300, 128, 0, 999, 2).unwrap();
+        assert_eq!(
+            (spec.red, spec.green, spec.blue, spec.alpha),
+            (255, 128, 0, 255)
+        );
+        assert_eq!(spec.width, 2);
+    }
+
+    #[test]
+    fn border_spec_non_positive_width_disables() {
+        // A non-positive width is the protocol's way to remove the border,
+        // mirroring the SetBorders dispatch arm removing the map entry.
+        assert_eq!(BorderSpec::from_protocol(255, 0, 0, 255, 0), None);
+        assert_eq!(BorderSpec::from_protocol(255, 0, 0, 255, -1), None);
+    }
+
+    #[test]
+    fn border_spec_color_is_premultiplied() {
+        // Half-transparent white: RGB channels are scaled by alpha.
+        let spec = BorderSpec::from_protocol(255, 255, 255, 127, 1).unwrap();
+        let [r, g, b, a] = spec.color_f32();
+        assert!((a - 127.0 / 255.0).abs() < f32::EPSILON);
+        for channel in [r, g, b] {
+            assert!((channel - a).abs() < f32::EPSILON);
+        }
+    }
+
+    /// Table-driven check of the `set_output` visibility bookkeeping the
+    /// SetOutput dispatch arm performs via `set_window_output`.
+    #[test]
+    fn window_output_assignment_controls_visibility() {
+        let win = WindowId::from_raw(1);
+        let second_output = "wayray-1";
+
+        // (assigned output, queried output, expected visibility)
+        let cases = [
+            // No multi-output config: everything resolves to the default.
+            (None, DEFAULT_OUTPUT, true),
+            (Some(DEFAULT_OUTPUT), DEFAULT_OUTPUT, true),
+            // Assigned to a known second output: only visible there.
+            (Some(second_output), second_output, true),
+            (Some(second_output), DEFAULT_OUTPUT, false),
+            (Some(DEFAULT_OUTPUT), second_output, false),
+            // Unknown assigned output falls back to the default output.
+            (Some("ghost-output"), DEFAULT_OUTPUT, true),
+            (Some("ghost-output"), second_output, false),
+        ];
+
+        for (assigned, queried, expected) in cases {
+            let mut ws = WorkspaceState::default();
+            // Make the second output known (it has active tags configured).
+            ws.set_active_tags(second_output.to_string(), 0x1);
+            if let Some(output) = assigned {
+                ws.set_window_output(win, output.to_string());
+                assert_eq!(ws.window_output(win), Some(output));
+            }
+            assert_eq!(
+                ws.is_visible(win, queried),
+                expected,
+                "assigned={assigned:?} queried={queried}"
+            );
+        }
     }
 }

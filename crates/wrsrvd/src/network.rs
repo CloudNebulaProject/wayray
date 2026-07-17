@@ -29,8 +29,9 @@ use tokio::runtime::Runtime;
 use tracing::{error, info, warn};
 use wayray_protocol::codec;
 use wayray_protocol::messages::{
-    ClientHello, ControlMessage, DisplayMessage, FrameUpdate, InputMessage, ServerHello,
-    ServerInfoMsg, SessionEvent, SessionLookupResponse,
+    AudioCodec, AudioMessage, AudioStart, ClientHello, ControlMessage, DisplayMessage, FrameUpdate,
+    InputMessage, ProtocolError, ProtocolErrorCode, ServerHello, ServerInfoMsg, SessionEvent,
+    SessionLookupResponse, caps,
 };
 use wayray_protocol::tls::verifier::{PinPolicy, PinnedServerCertVerifier};
 
@@ -52,8 +53,42 @@ pub enum CompositorToNet {
     /// client; the network thread discards any stale incremental frames queued
     /// for a previous connection until it sees one of these.
     SendKeyframe(FrameUpdate),
+    /// Forward a control message (e.g. clipboard sync) to the connected
+    /// client on the control stream. Clipboard messages are dropped when the
+    /// client did not advertise the `clipboard` capability.
+    SendControl(ControlMessage),
+    /// Forward an audio message on the dedicated audio stream. Dropped when
+    /// the client did not advertise the `audio` capability (the stream is
+    /// then never opened). Plumbing for a future audio backend.
+    SendAudio(AudioMessage),
     /// Shut down the network thread.
     Shutdown,
+}
+
+/// Capabilities advertised by a client in its `ClientHello`, resolved to a
+/// typed form and stored on the connection state. The server only opens
+/// streams / forwards messages for capabilities the client advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCapabilities {
+    /// Client renders frames — open the display stream.
+    pub display: bool,
+    /// Client handles clipboard control messages.
+    pub clipboard: bool,
+    /// Client accepts the dedicated audio stream.
+    pub audio: bool,
+}
+
+impl ClientCapabilities {
+    /// Resolve an advertised capability list. Unknown capability names are
+    /// ignored (forward compatibility with newer clients).
+    pub fn from_advertised(advertised: &[String]) -> Self {
+        let has = |name: &str| advertised.iter().any(|c| c == name);
+        Self {
+            display: has(caps::DISPLAY),
+            clipboard: has(caps::CLIPBOARD),
+            audio: has(caps::AUDIO),
+        }
+    }
 }
 
 /// Resolved session binding returned by the compositor in response to a
@@ -95,6 +130,9 @@ pub enum NetToCompositor {
     /// the client to the server that owns its session.
     ClientConnected {
         hello: ClientHello,
+        /// Remote endpoint address of the connecting client (for admin
+        /// visibility; e.g. `wradm sessions`).
+        remote_addr: String,
         reply: mpsc::Sender<ConnectDecision>,
     },
     /// Client disconnected.
@@ -501,6 +539,10 @@ async fn classify_connection(
     match first {
         ControlMessage::ClientHello(hello) => {
             info!(version = hello.version, "received ClientHello");
+            if !wayray_protocol::version_compatible(hello.version) {
+                reject_incompatible_client(connection, &mut control_send, hello.version).await;
+                return Ok(None);
+            }
             Ok(Some((control_send, control_recv, hello)))
         }
         ControlMessage::ServerInfoRequest { auth } => {
@@ -542,6 +584,49 @@ async fn classify_connection(
         )
         .into()),
     }
+}
+
+/// Reject a client whose protocol version is outside the supported range:
+/// send a typed `ProtocolError` on the control stream (so a compatible-enough
+/// client can show a clean diagnostic instead of a bare EOF), give the client
+/// a moment to read it, then close the connection with a descriptive reason.
+///
+/// Rejection happens here in the classifier — before the connection is routed
+/// to the client handler — so an incompatible client can never preempt an
+/// in-progress session (hot-desk takeover is reserved for servable clients).
+async fn reject_incompatible_client(
+    connection: &quinn::Connection,
+    control_send: &mut quinn::SendStream,
+    client_version: u32,
+) {
+    let reason = format!(
+        "client protocol version {client_version} is not supported by this server \
+         (supported: {}..={})",
+        wayray_protocol::MIN_PROTOCOL_VERSION,
+        wayray_protocol::PROTOCOL_VERSION,
+    );
+    warn!(
+        client_version,
+        "rejecting client with incompatible protocol version"
+    );
+
+    let msg = ControlMessage::ProtocolError(ProtocolError {
+        code: ProtocolErrorCode::VersionMismatch,
+        reason: reason.clone(),
+    });
+    if let Err(e) = write_message(control_send, &msg).await {
+        warn!(error = %e, "failed to send version-mismatch rejection");
+    }
+    let _ = control_send.finish();
+
+    // Wait briefly for the client to read the rejection and close on its own;
+    // then close with a descriptive reason either way (the close frame is the
+    // fallback diagnostic for clients too old to decode `ProtocolError`).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.closed()).await;
+    connection.close(
+        wayray_protocol::close_codes::VERSION_MISMATCH.into(),
+        reason.as_bytes(),
+    );
 }
 
 /// Await a `ConnectDecision` reply from the compositor, polling the blocking
@@ -602,6 +687,12 @@ async fn serve_client(
         hello,
     } = routed;
 
+    // Resolve advertised capabilities once and keep them on the connection
+    // state: streams are only opened, and optional messages only forwarded,
+    // for capabilities the client asked for.
+    let capabilities = ClientCapabilities::from_advertised(&hello.capabilities);
+    info!(?capabilities, "client capabilities resolved");
+
     // Round-trip to the compositor: it resolves the session via the registry
     // and replies with either a binding (serve here) or a redirect (the session
     // lives on another server / load balancing). The wait is generously bounded
@@ -612,6 +703,7 @@ async fn serve_client(
     let connect_start = std::time::Instant::now();
     let _ = compositor_tx.send(NetToCompositor::ClientConnected {
         hello,
+        remote_addr: connection.remote_address().to_string(),
         reply: reply_tx,
     });
 
@@ -663,10 +755,36 @@ async fn serve_client(
         }
     }
 
-    // Step 3: Open display uni stream. Writing data triggers the client's
-    // accept_uni for this stream.
-    let mut display_send = connection.open_uni().await?;
-    info!("display stream opened");
+    // Step 3: Open display uni stream (only when the client renders frames).
+    // Writing data triggers the client's accept_uni for this stream.
+    let mut display_send: Option<quinn::SendStream> = if capabilities.display {
+        let send = connection.open_uni().await?;
+        info!("display stream opened");
+        Some(send)
+    } else {
+        info!("client did not advertise the display capability; display stream not opened");
+        None
+    };
+
+    // Step 3b: Open the dedicated audio stream when the client advertised the
+    // audio capability. This is the only *server-initiated bidirectional*
+    // stream, so the client can distinguish it from the display uni stream
+    // without relying on stream ordering. An initial `AudioStart` announces
+    // the reserved channel (and materializes the stream on the wire); a future
+    // audio backend re-declares the format before sending chunks.
+    let mut audio_send: Option<quinn::SendStream> = if capabilities.audio {
+        let (mut send, _audio_recv) = connection.open_bi().await?;
+        let start = AudioMessage::Start(AudioStart {
+            sample_rate: 48_000,
+            channels: 2,
+            codec: AudioCodec::PcmS16Le,
+        });
+        write_message(&mut send, &start).await?;
+        info!("audio stream opened (no backend yet; chunks are not produced)");
+        Some(send)
+    } else {
+        None
+    };
 
     // Step 4: Message relay loop. Accept the input uni stream concurrently
     // with handling control messages and compositor commands.
@@ -726,6 +844,9 @@ async fn serve_client(
             _ = check_compositor_commands(
                 compositor_rx,
                 &mut display_send,
+                &mut audio_send,
+                &mut control_send,
+                capabilities,
                 &mut keyframe_seen,
             ) => {
                 // Shutdown requested.
@@ -737,9 +858,15 @@ async fn serve_client(
 
 /// Process commands from the compositor channel. Returns when shutdown
 /// is requested or the channel is disconnected.
+///
+/// `display_send`/`audio_send` are `None` when the client did not advertise
+/// the matching capability; the corresponding messages are then dropped.
 async fn check_compositor_commands(
     rx: &mpsc::Receiver<CompositorToNet>,
-    display_send: &mut quinn::SendStream,
+    display_send: &mut Option<quinn::SendStream>,
+    audio_send: &mut Option<quinn::SendStream>,
+    control_send: &mut quinn::SendStream,
+    capabilities: ClientCapabilities,
     keyframe_seen: &mut bool,
 ) {
     loop {
@@ -752,6 +879,9 @@ async fn check_compositor_commands(
                 if !*keyframe_seen {
                     continue;
                 }
+                let Some(display_send) = display_send.as_mut() else {
+                    continue; // client renders no frames
+                };
                 let msg = DisplayMessage::FrameUpdate(frame);
                 if let Err(e) = write_message(display_send, &msg).await {
                     warn!("failed to send frame: {e}");
@@ -762,9 +892,38 @@ async fn check_compositor_commands(
                 // A keyframe is a complete frame; it resyncs the client and
                 // marks the start of this connection's valid stream.
                 *keyframe_seen = true;
+                let Some(display_send) = display_send.as_mut() else {
+                    continue; // client renders no frames
+                };
                 let msg = DisplayMessage::FrameUpdate(frame);
                 if let Err(e) = write_message(display_send, &msg).await {
                     warn!("failed to send keyframe: {e}");
+                    return;
+                }
+            }
+            Ok(CompositorToNet::SendControl(msg)) => {
+                // Clipboard sync is opt-in: drop clipboard messages for
+                // clients that did not advertise the capability.
+                let is_clipboard = matches!(
+                    msg,
+                    ControlMessage::ClipboardOffer(_) | ControlMessage::ClipboardData(_)
+                );
+                if is_clipboard && !capabilities.clipboard {
+                    tracing::trace!("dropping clipboard message: capability not advertised");
+                    continue;
+                }
+                if let Err(e) = write_message(control_send, &msg).await {
+                    warn!("failed to send control message: {e}");
+                    return;
+                }
+            }
+            Ok(CompositorToNet::SendAudio(msg)) => {
+                let Some(audio_send) = audio_send.as_mut() else {
+                    tracing::trace!("dropping audio message: capability not advertised");
+                    continue;
+                };
+                if let Err(e) = write_message(audio_send, &msg).await {
+                    warn!("failed to send audio message: {e}");
                     return;
                 }
             }
@@ -900,6 +1059,8 @@ async fn read_message<T: serde::de::DeserializeOwned>(
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    // Never trust the wire: cap before allocating.
+    codec::check_message_size(len)?;
 
     // Read payload.
     let mut payload = vec![0u8; len];
@@ -1218,7 +1379,7 @@ mod tests {
         let fake_compositor = std::thread::spawn(move || {
             loop {
                 match net_to_comp_rx.recv() {
-                    Ok(NetToCompositor::ClientConnected { hello, reply }) => {
+                    Ok(NetToCompositor::ClientConnected { hello, reply, .. }) => {
                         assert_eq!(hello.token.as_deref(), Some("session-token"));
                         reply
                             .send(ConnectDecision::Bind(SessionBinding {
@@ -1507,6 +1668,212 @@ mod tests {
                 }
                 other => panic!("expected SessionRedirect, got {other:?}"),
             }
+
+            drop(control_send);
+            drop(control_recv);
+            drop(connection);
+            let _ = comp_to_net_tx.send(CompositorToNet::Shutdown);
+        };
+
+        tokio::join!(server_fut, client_fut);
+        let _ = fake_compositor.join();
+    }
+
+    #[test]
+    fn capabilities_resolve_from_advertised_list() {
+        let all = ClientCapabilities::from_advertised(&[
+            "display".to_string(),
+            "clipboard".to_string(),
+            "audio".to_string(),
+            "future-unknown".to_string(), // unknown names are ignored
+        ]);
+        assert!(all.display && all.clipboard && all.audio);
+
+        let none = ClientCapabilities::from_advertised(&[]);
+        assert!(!none.display && !none.clipboard && !none.audio);
+
+        let display_only = ClientCapabilities::from_advertised(&["display".to_string()]);
+        assert!(display_only.display && !display_only.clipboard && !display_only.audio);
+    }
+
+    /// A client with an incompatible protocol version is rejected in the
+    /// classifier: it receives a typed `ProtocolError` on the control stream
+    /// and the connection is closed with the version-mismatch close code —
+    /// instead of hanging or a bare EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn incompatible_version_is_rejected_with_protocol_error() {
+        let (server_config, _fp) = build_server_config();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let actual_addr = endpoint.local_addr().unwrap();
+
+        let cfg = ServerConfig::default();
+        let active = Arc::new(AtomicU32::new(0));
+        let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
+
+        let server_fut = async {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            // The classifier must swallow the connection (no routed client).
+            let routed = classify_connection(&connection, &cfg, &active, &tokens)
+                .await
+                .unwrap();
+            assert!(routed.is_none(), "incompatible client must not be routed");
+        };
+
+        let client_fut = async {
+            let client_endpoint = build_test_client_endpoint();
+            let connection = client_endpoint
+                .connect(actual_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut control_send, mut control_recv) = connection.open_bi().await.unwrap();
+
+            let bogus_version = wayray_protocol::PROTOCOL_VERSION + 100;
+            let client_hello = ControlMessage::ClientHello(ClientHello {
+                version: bogus_version,
+                capabilities: vec![],
+                token: None,
+            });
+            write_message(&mut control_send, &client_hello)
+                .await
+                .unwrap();
+
+            // The server must answer with a typed rejection, not silence.
+            let response: ControlMessage = read_message(&mut control_recv).await.unwrap();
+            match response {
+                ControlMessage::ProtocolError(err) => {
+                    assert_eq!(err.code, ProtocolErrorCode::VersionMismatch);
+                    assert!(err.reason.contains(&bogus_version.to_string()));
+                    assert!(
+                        err.reason
+                            .contains(&wayray_protocol::PROTOCOL_VERSION.to_string())
+                    );
+                }
+                other => panic!("expected ProtocolError, got {other:?}"),
+            }
+
+            // After the rejection the stream is finished: the next read hits a
+            // clean end-of-stream / close, never a hang.
+            let next = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_message::<ControlMessage>(&mut control_recv),
+            )
+            .await
+            .expect("connection must terminate promptly after rejection");
+            assert!(next.is_err(), "no further messages after a rejection");
+
+            drop(control_send);
+            drop(control_recv);
+            connection.close(0u32.into(), b"done");
+        };
+
+        tokio::join!(server_fut, client_fut);
+    }
+
+    /// Full `serve_client` harness for the v2 extras: a client advertising
+    /// `clipboard` and `audio` gets (a) the dedicated audio stream — a
+    /// server-initiated bidi stream announcing itself with `AudioStart` — and
+    /// (b) clipboard control messages forwarded from the compositor channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn clipboard_and_audio_reach_capable_client() {
+        let (server_config, _fp) = build_server_config();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let actual_addr = endpoint.local_addr().unwrap();
+
+        let (comp_to_net_tx, comp_to_net_rx) = mpsc::channel::<CompositorToNet>();
+        let (net_to_comp_tx, net_to_comp_rx) = mpsc::channel::<NetToCompositor>();
+
+        let fake_compositor = std::thread::spawn(move || {
+            loop {
+                match net_to_comp_rx.recv() {
+                    Ok(NetToCompositor::ClientConnected { reply, .. }) => {
+                        reply
+                            .send(ConnectDecision::Bind(SessionBinding {
+                                session_id: 1,
+                                resumed: false,
+                                token: "t".into(),
+                            }))
+                            .unwrap();
+                    }
+                    Ok(NetToCompositor::ClientDisconnected) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let cfg = ServerConfig::default();
+        let active = Arc::new(AtomicU32::new(0));
+        let tokens: LocalTokens = Arc::new(Mutex::new(HashSet::new()));
+        let server_fut = async {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            if let Ok(Some((control_send, control_recv, hello))) =
+                classify_connection(&connection, &cfg, &active, &tokens).await
+            {
+                let routed = RoutedClient {
+                    connection,
+                    control_send,
+                    control_recv,
+                    hello,
+                };
+                let _ = serve_client(routed, &cfg, &comp_to_net_rx, &net_to_comp_tx).await;
+            }
+            let _ = net_to_comp_tx.send(NetToCompositor::ClientDisconnected);
+            endpoint.close(0u32.into(), b"done");
+        };
+
+        let client_fut = async {
+            let client_endpoint = build_test_client_endpoint();
+            let connection = client_endpoint
+                .connect(actual_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut control_send, mut control_recv) = connection.open_bi().await.unwrap();
+            let client_hello = ControlMessage::ClientHello(ClientHello {
+                version: wayray_protocol::PROTOCOL_VERSION,
+                capabilities: vec![
+                    "display".to_string(),
+                    "clipboard".to_string(),
+                    "audio".to_string(),
+                ],
+                token: None,
+            });
+            write_message(&mut control_send, &client_hello)
+                .await
+                .unwrap();
+
+            let response: ControlMessage = read_message(&mut control_recv).await.unwrap();
+            assert!(matches!(response, ControlMessage::ServerHello(_)));
+
+            // The audio stream is the only server-initiated bidi stream and
+            // announces itself with an `AudioStart`.
+            let (_audio_send, mut audio_recv) = connection.accept_bi().await.unwrap();
+            let audio: AudioMessage = read_message(&mut audio_recv).await.unwrap();
+            match audio {
+                AudioMessage::Start(start) => {
+                    assert_eq!(start.sample_rate, 48_000);
+                    assert_eq!(start.channels, 2);
+                    assert_eq!(start.codec, AudioCodec::PcmS16Le);
+                }
+                other => panic!("expected AudioStart, got {other:?}"),
+            }
+
+            // Clipboard forwarded from the compositor arrives on the control
+            // stream.
+            let clip = ControlMessage::ClipboardData(wayray_protocol::messages::ClipboardData {
+                mime_type: "text/plain;charset=utf-8".to_string(),
+                data: b"copied on the server".to_vec(),
+            });
+            comp_to_net_tx
+                .send(CompositorToNet::SendControl(clip.clone()))
+                .unwrap();
+
+            let forwarded: ControlMessage = read_message(&mut control_recv).await.unwrap();
+            assert_eq!(forwarded, clip);
 
             drop(control_send);
             drop(control_recv);

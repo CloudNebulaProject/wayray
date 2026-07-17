@@ -67,8 +67,100 @@ pub enum ZOrder {
     Top,
     /// Place at the bottom of the stack.
     Bottom,
+    /// Place directly above the given sibling window.
+    Above(WindowId),
+    /// Place directly below the given sibling window.
+    Below(WindowId),
     /// Keep current z-order (no change).
     Preserve,
+}
+
+/// Compute the new stacking order (bottom → top) after applying the z-order
+/// directives carried by `commands` to the current `stack`.
+///
+/// Directives are applied in command order, so later commands win on conflict.
+/// Windows not present in `stack` (hidden/unmapped) and unknown siblings are
+/// ignored; a window ordered relative to itself is a no-op.
+pub fn restack(stack: &[WindowId], commands: &[RenderCommand]) -> Vec<WindowId> {
+    let mut order: Vec<WindowId> = stack.to_vec();
+    for cmd in commands {
+        let Some(pos) = order.iter().position(|w| *w == cmd.id) else {
+            continue;
+        };
+        match cmd.z_order {
+            ZOrder::Preserve => {}
+            ZOrder::Top => {
+                let w = order.remove(pos);
+                order.push(w);
+            }
+            ZOrder::Bottom => {
+                let w = order.remove(pos);
+                order.insert(0, w);
+            }
+            ZOrder::Above(sibling) | ZOrder::Below(sibling) => {
+                if sibling == cmd.id {
+                    continue;
+                }
+                let w = order.remove(pos);
+                match order.iter().position(|s| *s == sibling) {
+                    Some(sib_pos) => {
+                        let insert_at = match cmd.z_order {
+                            ZOrder::Above(_) => sib_pos + 1,
+                            _ => sib_pos,
+                        };
+                        order.insert(insert_at, w);
+                    }
+                    // Unknown sibling: restore the original position.
+                    None => order.insert(pos, w),
+                }
+            }
+        }
+    }
+    order
+}
+
+/// Server-side border specification for a window, set by the WM via the
+/// `set_borders` request. Color channels are 0–255 as carried on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderSpec {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+    /// Border thickness in logical pixels (always > 0).
+    pub width: i32,
+}
+
+impl BorderSpec {
+    /// Build a border spec from raw `set_borders` protocol arguments.
+    ///
+    /// Returns `None` for a non-positive width, which the protocol treats as
+    /// "remove the border". Channel values are clamped to 255.
+    pub fn from_protocol(red: u32, green: u32, blue: u32, alpha: u32, width: i32) -> Option<Self> {
+        if width <= 0 {
+            return None;
+        }
+        Some(Self {
+            red: red.min(255) as u8,
+            green: green.min(255) as u8,
+            blue: blue.min(255) as u8,
+            alpha: alpha.min(255) as u8,
+            width,
+        })
+    }
+
+    /// Premultiplied RGBA color for the renderer ([`Color32F`] semantics).
+    ///
+    /// [`Color32F`]: smithay::backend::renderer::Color32F
+    pub fn color_f32(&self) -> [f32; 4] {
+        let a = self.alpha as f32 / 255.0;
+        [
+            self.red as f32 / 255.0 * a,
+            self.green as f32 / 255.0 * a,
+            self.blue as f32 / 255.0 * a,
+            a,
+        ]
+    }
 }
 
 use std::collections::HashMap;
@@ -107,6 +199,9 @@ pub struct WorkspaceState {
     pub window_tags: HashMap<WindowId, u32>,
     /// Active tag bitmask per output (output_name -> bitmask). Defaults to 0x1.
     pub active_tags: HashMap<String, u32>,
+    /// Window -> assigned output name (`set_output`). Windows without an
+    /// assignment follow the single-output default behavior.
+    pub window_output: HashMap<WindowId, String>,
 }
 
 impl Default for WorkspaceState {
@@ -120,6 +215,7 @@ impl Default for WorkspaceState {
             window_workspace: HashMap::new(),
             window_tags: HashMap::new(),
             active_tags,
+            window_output: HashMap::new(),
         }
     }
 }
@@ -210,15 +306,33 @@ impl WorkspaceState {
         self.window_workspace.remove(&id);
     }
 
+    /// Assign a window to a named output (`set_output` bookkeeping).
+    pub fn set_window_output(&mut self, id: WindowId, output_name: String) {
+        self.window_output.insert(id, output_name);
+    }
+
+    /// The output a window is assigned to, if any.
+    pub fn window_output(&self, id: WindowId) -> Option<&str> {
+        self.window_output.get(&id).map(|s| s.as_str())
+    }
+
     /// Whether a window should be visible on the given output.
     ///
     /// Rules (in order):
-    /// 1. If the window has a tag bitmask, it is visible iff
+    /// 1. If the window is assigned to an output (`set_output`) and that output
+    ///    does not resolve to the queried one, it is not visible there. Unknown
+    ///    output names resolve to the default output (single-output fallback).
+    /// 2. If the window has a tag bitmask, it is visible iff
     ///    `(tags & active_tags(output)) != 0`.
-    /// 2. Else if the window is assigned to a workspace, it is visible iff that
+    /// 3. Else if the window is assigned to a workspace, it is visible iff that
     ///    workspace is the active workspace on the output.
-    /// 3. Else (no assignment) the window is always visible.
+    /// 4. Else (no assignment) the window is always visible.
     pub fn is_visible(&self, id: WindowId, output: &str) -> bool {
+        if let Some(assigned) = self.window_output.get(&id)
+            && self.output_key(assigned) != self.output_key(output)
+        {
+            return false;
+        }
         if let Some(tags) = self.window_tags.get(&id) {
             return (tags & self.active_tags_for(output)) != 0;
         }

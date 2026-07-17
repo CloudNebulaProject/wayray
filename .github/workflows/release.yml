@@ -1,0 +1,131 @@
+name: Release (beta)
+
+# Beta release pipeline: builds installable tarballs for Linux x86_64 and
+# illumos x86_64 (built on OpenIndiana, runs on OpenIndiana/OmniOS).
+#
+# - Tag push `v*` (e.g. v0.1.0-beta.1): builds and attaches the tarballs to a
+#   GitHub prerelease for that tag.
+# - workflow_dispatch, or a PR touching the release machinery itself: dry run —
+#   builds and uploads the tarballs as workflow artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux x86_64 tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe` versions the tarball.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libpixman-1-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --workspace --release --locked
+
+      - name: Package
+        run: sh packaging/package.sh linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayray-linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: dist/*.tar.gz
+
+  # Built inside an OpenIndiana VM so the artifact links against illumos
+  # libc/libraries; the resulting tarball installs on OpenIndiana and OmniOS.
+  # The client viewer (wrclient) is excluded — beta ships the server-side set.
+  illumos:
+    name: illumos x86_64 tarball (OpenIndiana)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build in OpenIndiana VM
+        uses: vmactions/openindiana-vm@v1
+        with:
+          usesh: true
+          mem: 8192
+          prepare: |
+            set -x
+            pkg publisher || true
+            pkg install -v developer/gcc-14 developer/build/pkg-config || true
+            # No system libwayland needed: the vendored wayland-backend uses its
+            # pure-Rust backend (with the illumos epoll shim). pixman + xkbcommon
+            # are runtime/link deps of the smithay renderer and keyboard handling.
+            pkg install -v library/graphics/pixman x11/library/libxkbcommon || true
+            # rustup-init (and rustc-built binaries) need 64-bit libgcc_s.so.1,
+            # which OpenIndiana ships under /usr/gcc/<ver>/lib/amd64.
+            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:${LD_LIBRARY_PATH:-}"
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            export PATH="$HOME/.cargo/bin:/usr/gnu/bin:$PATH"
+            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:${LD_LIBRARY_PATH:-}"
+            rustc --version
+            cargo --version
+            cargo build --release --locked \
+              -p wrsrvd -p wradm -p wrsessd -p wrlogin -p wr-wm-tiling \
+              --features wrsessd/doors
+            sh packaging/package.sh illumos-x86_64 wrsrvd wradm wrsessd wrlogin wr-wm-tiling
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayray-illumos-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: dist/*.tar.gz

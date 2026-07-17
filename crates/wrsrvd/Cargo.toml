@@ -22,6 +22,7 @@ quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
 tokio.workspace = true
+sea-orm.workspace = true
 getrandom = "0.3"
 
 smithay = { version = "0.7", default-features = false, features = [
