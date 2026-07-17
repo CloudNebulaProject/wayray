@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,8 +36,10 @@ use wayray_protocol::cluster::ClusterConfig;
 use wayray_protocol::tls::PinStore;
 use wayray_protocol::tls::verifier::PinPolicy;
 
+use crate::admin::{AdminHandle, AdminQuery};
 use crate::errors::WayRayError;
 use crate::handlers::ClientState;
+use crate::launcher_link::LauncherLink;
 use crate::network::{
     CompositorToNet, ConnectDecision, NetToCompositor, NetworkHandle, SessionBinding,
 };
@@ -93,6 +96,16 @@ struct CalloopData {
     /// gives the damage tracker stable element ids, so unchanged borders
     /// produce no damage.
     border_buffers: HashMap<WindowId, [SolidColorBuffer; 4]>,
+    /// Best-effort link to the session launcher (wrsessd); `None` unless
+    /// `--launcher-socket` was given.
+    launcher: Option<LauncherLink>,
+    /// Admin control socket bridge; `None` unless `--admin-socket` was given.
+    admin: Option<AdminHandle>,
+    /// Remote address of the currently connected client endpoint, for admin
+    /// session listings.
+    connected_client_addr: Option<String>,
+    /// When the compositor entered its main loop (for admin uptime reporting).
+    server_started: Instant,
 }
 
 /// Maximum wall-clock the compositor thread will spend probing peers for a
@@ -122,7 +135,9 @@ pub fn run(
     output: Output,
     net_handle: NetworkHandle,
     cluster: ClusterConfig,
-    state_db: Option<std::path::PathBuf>,
+    state_db: Option<PathBuf>,
+    launcher_socket: Option<PathBuf>,
+    admin_socket: Option<PathBuf>,
 ) -> Result<()> {
     // Create the PixmanRenderer (CPU software renderer).
     let mut renderer = PixmanRenderer::new().map_err(|e| {
@@ -158,6 +173,22 @@ pub fn run(
     // SAFETY: This is called early in main before any other threads are spawned,
     // so there are no concurrent readers of the environment.
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+
+    // Optional session-launcher link: notify wrsessd of session lifecycle so
+    // it can spawn the greeter/desktop into this compositor. Best-effort — a
+    // missing or broken launcher never affects the compositor.
+    let launcher = launcher_socket
+        .map(|path| LauncherLink::start(path, socket_name.to_string_lossy().into_owned()));
+
+    // Optional admin control socket for `wradm sessions` / `wradm status`.
+    // A bind failure is logged and the compositor continues without it.
+    let admin = admin_socket.and_then(|path| match crate::admin::start(&path) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "failed to start admin socket; continuing without it");
+            None
+        }
+    });
 
     // Create the calloop event loop.
     let mut event_loop: EventLoop<CalloopData> =
@@ -252,6 +283,10 @@ pub fn run(
                 .expect("temp pin store")
         }))),
         border_buffers: HashMap::new(),
+        launcher,
+        admin,
+        connected_client_addr: None,
+        server_started: Instant::now(),
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -268,12 +303,25 @@ pub fn run(
         // Drain network events (input from remote clients, connection state).
         drain_network_events(&mut calloop_data);
 
+        // Answer any pending admin queries (wradm sessions / status).
+        drain_admin_queries(&mut calloop_data);
+
         // Periodically clean up expired suspended sessions (~every 60s at 60fps).
         cleanup_counter += 1;
         if cleanup_counter >= 3600 {
             cleanup_counter = 0;
             let expired = calloop_data.session_registry.cleanup_expired();
             if !expired.is_empty() {
+                // Tell the launcher each destroyed session is gone so it can
+                // tear down the greeter/desktop processes. Must happen before
+                // the purge below removes the sessions (and their tokens).
+                if let Some(link) = &calloop_data.launcher {
+                    for id in &expired {
+                        if let Some(session) = calloop_data.session_registry.get(*id) {
+                            link.session_destroyed(session.token.0.clone(), id.raw());
+                        }
+                    }
+                }
                 calloop_data.session_registry.purge_destroyed();
             }
             // Drop stale cross-server affinity entries so we re-probe rather
@@ -313,7 +361,11 @@ fn drain_network_events(data: &mut CalloopData) {
             Ok(NetToCompositor::Input(input_msg)) => {
                 data.state.inject_network_input(input_msg);
             }
-            Ok(NetToCompositor::ClientConnected { hello, reply }) => {
+            Ok(NetToCompositor::ClientConnected {
+                hello,
+                remote_addr,
+                reply,
+            }) => {
                 // Time the resolve so we can validate the <500ms hot-desk
                 // reconnect target end-to-end (the network thread blocks on
                 // this reply before composing the ServerHello).
@@ -407,12 +459,21 @@ fn drain_network_events(data: &mut CalloopData) {
                         if let Err(e) = data.session_registry.activate(id) {
                             warn!(error = %e, "failed to activate new session");
                         }
+
+                        // Tell the session launcher (if linked) to prepare the
+                        // environment and start the greeter for this brand-new
+                        // session. Best-effort: delivery failures are logged by
+                        // the link worker and never affect the compositor.
+                        if let Some(link) = &data.launcher {
+                            link.session_created(token.0.clone());
+                        }
                         (id, false)
                     }
                 };
 
                 data.active_session = Some(session_id);
                 data.client_connected = true;
+                data.connected_client_addr = Some(remote_addr);
 
                 // A client (new or resumed) joins with an all-black local
                 // framebuffer and reconstructs the image by XORing the deltas
@@ -464,6 +525,7 @@ fn drain_network_events(data: &mut CalloopData) {
                     }
                 }
                 data.client_connected = false;
+                data.connected_client_addr = None;
                 // Refresh the published load/location state for peer queries.
                 // A suspended session is still resumable, so it stays in the
                 // published token set and a reconnecting client elsewhere is
@@ -489,6 +551,36 @@ fn drain_network_events(data: &mut CalloopData) {
                 break;
             }
         }
+    }
+}
+
+/// Answer any pending admin queries (from the `--admin-socket` bridge) out of
+/// the live session registry. Non-blocking: drains whatever the admin thread
+/// has queued and replies through each query's bounded reply channel.
+fn drain_admin_queries(data: &mut CalloopData) {
+    use wayray_protocol::admin::{AdminRequest, AdminResponse, ServerStatus};
+
+    let Some(admin) = &data.admin else { return };
+    while let Ok(AdminQuery { request, reply }) = admin.rx.try_recv() {
+        let response = match request {
+            AdminRequest::ListSessions => {
+                let connected_client = data
+                    .active_session
+                    .filter(|_| data.client_connected)
+                    .map(|id| (id, data.connected_client_addr.as_deref()));
+                AdminResponse::SessionList {
+                    sessions: data.session_registry.admin_snapshot(connected_client),
+                }
+            }
+            AdminRequest::ServerStatus => AdminResponse::ServerStatus(ServerStatus {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                uptime_secs: data.server_started.elapsed().as_secs(),
+                sessions: data.session_registry.state_counts(),
+                cluster_peers: data.cluster.peers().count(),
+            }),
+        };
+        // The admin thread may have timed out and gone away; ignore.
+        let _ = reply.send(response);
     }
 }
 

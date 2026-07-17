@@ -1,6 +1,8 @@
+pub mod admin;
 mod backend;
 mod errors;
 mod handlers;
+pub mod launcher_link;
 pub mod network;
 pub mod session;
 mod state;
@@ -32,6 +34,29 @@ fn main() -> Result<()> {
     let use_winit = args
         .windows(2)
         .any(|w| w[0] == "--backend" && w[1] == "winit");
+
+    // Optional session-launcher socket (`--launcher-socket <path>` or
+    // WAYRAY_LAUNCHER_SOCKET). When set, wrsrvd notifies the launcher daemon
+    // (wrsessd) of session create/destroy so it can spawn the greeter/desktop.
+    // Disabled by default; the compositor is fully functional without it.
+    let launcher_socket = args
+        .windows(2)
+        .find(|w| w[0] == "--launcher-socket")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+        .or_else(|| std::env::var_os("WAYRAY_LAUNCHER_SOCKET").map(std::path::PathBuf::from));
+
+    // Optional admin control socket (`--admin-socket [path]` or
+    // WAYRAY_ADMIN_SOCKET) serving `wradm sessions` / `wradm status`. Giving
+    // the flag without a path uses the default location.
+    let admin_socket = match args.iter().position(|a| a == "--admin-socket") {
+        Some(i) => Some(
+            args.get(i + 1)
+                .filter(|next| !next.starts_with("--"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(wayray_protocol::admin::default_admin_socket_path),
+        ),
+        None => std::env::var_os("WAYRAY_ADMIN_SOCKET").map(std::path::PathBuf::from),
+    };
 
     // Load multi-server cluster configuration. `--cluster <path>` overrides the
     // default search locations; absent config means single-server mode.
@@ -121,6 +146,11 @@ fn main() -> Result<()> {
     );
 
     if use_winit {
+        if launcher_socket.is_some() || admin_socket.is_some() {
+            tracing::warn!(
+                "--launcher-socket / --admin-socket are only supported by the headless backend; ignoring"
+            );
+        }
         #[cfg(feature = "winit")]
         {
             let result = backend::winit::run(display, state, output);
@@ -134,5 +164,14 @@ fn main() -> Result<()> {
         }
     }
 
-    backend::headless::run(display, state, output, net_handle, cluster, state_db)
+    backend::headless::run(
+        display,
+        state,
+        output,
+        net_handle,
+        cluster,
+        state_db,
+        launcher_socket,
+        admin_socket,
+    )
 }

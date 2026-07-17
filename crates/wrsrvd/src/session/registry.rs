@@ -381,6 +381,76 @@ impl SessionRegistry {
     pub fn count_by_state(&self, state: SessionState) -> usize {
         self.sessions.values().filter(|s| s.state == state).count()
     }
+
+    /// Session counts broken down by state, for admin `ServerStatus` queries.
+    pub fn state_counts(&self) -> wayray_protocol::admin::SessionCounts {
+        let mut counts = wayray_protocol::admin::SessionCounts::default();
+        for session in self.sessions.values() {
+            match session.state {
+                SessionState::Creating => counts.creating += 1,
+                SessionState::Active => counts.active += 1,
+                SessionState::Suspended => counts.suspended += 1,
+                SessionState::Destroyed => counts.destroyed += 1,
+            }
+        }
+        counts
+    }
+
+    /// Read-only snapshot of every session for admin `ListSessions` queries,
+    /// sorted by id. Tokens are redacted to a prefix — the full token is a
+    /// bearer credential and never leaves the compositor via this channel.
+    ///
+    /// `connected_client` attaches the remote endpoint address to the session
+    /// currently bound to the connected client (if any).
+    pub fn admin_snapshot(
+        &self,
+        connected_client: Option<(SessionId, Option<&str>)>,
+    ) -> Vec<wayray_protocol::admin::SessionEntry> {
+        use std::time::SystemTime;
+        use wayray_protocol::admin::{SessionEntry, redact_token};
+
+        let now_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut entries: Vec<SessionEntry> = self
+            .sessions
+            .values()
+            .map(|s| {
+                let uptime_secs = s.created_at.elapsed().as_secs();
+                // Instants are monotonic, not wall-clock; approximate wall
+                // times by subtracting monotonic ages from "now".
+                let created_at_epoch_secs = now_epoch.saturating_sub(uptime_secs);
+                let last_active_epoch_secs = match s.state {
+                    // An active session is active right now.
+                    SessionState::Active => now_epoch,
+                    // A suspended session was last active when it suspended.
+                    SessionState::Suspended | SessionState::Destroyed => s
+                        .suspended_at
+                        .map(|t| now_epoch.saturating_sub(t.elapsed().as_secs()))
+                        .unwrap_or(created_at_epoch_secs),
+                    SessionState::Creating => created_at_epoch_secs,
+                };
+                let client_addr = match connected_client {
+                    Some((id, addr)) if id == s.id => addr.map(str::to_string),
+                    _ => None,
+                };
+                SessionEntry {
+                    id: s.id.raw(),
+                    token_prefix: redact_token(s.token.as_str()),
+                    user: s.user.clone(),
+                    state: s.state.to_string(),
+                    created_at_epoch_secs,
+                    last_active_epoch_secs,
+                    uptime_secs,
+                    client_addr,
+                }
+            })
+            .collect();
+        entries.sort_by_key(|e| e.id);
+        entries
+    }
 }
 
 impl Default for SessionRegistry {
@@ -597,6 +667,56 @@ mod tests {
         reg.destroy(active).unwrap();
         let tokens = reg.resumable_tokens();
         assert_eq!(tokens, vec!["suspended-tok".to_string()]);
+    }
+
+    #[test]
+    fn admin_snapshot_redacts_tokens_and_attaches_client() {
+        let mut reg = SessionRegistry::new();
+        let active = reg.create_session(SessionToken::new("0123456789abcdef"));
+        let suspended = reg.create_session(SessionToken::new("fedcba9876543210"));
+        reg.activate(active).unwrap();
+        reg.activate(suspended).unwrap();
+        reg.suspend(suspended).unwrap();
+        reg.set_user(active, "alice".to_string());
+
+        let snapshot = reg.admin_snapshot(Some((active, Some("192.0.2.9:5000"))));
+        assert_eq!(snapshot.len(), 2);
+
+        // Sorted by id; the first is the active session.
+        let a = &snapshot[0];
+        assert_eq!(a.id, active.raw());
+        assert_eq!(a.state, "active");
+        assert_eq!(a.user.as_deref(), Some("alice"));
+        assert_eq!(a.client_addr.as_deref(), Some("192.0.2.9:5000"));
+        // The full token must never appear; only a redacted prefix.
+        assert_eq!(a.token_prefix, "01234567\u{2026}");
+        assert!(!a.token_prefix.contains("89abcdef"));
+
+        let s = &snapshot[1];
+        assert_eq!(s.state, "suspended");
+        assert_eq!(s.client_addr, None);
+        assert!(s.last_active_epoch_secs >= s.created_at_epoch_secs);
+
+        // Without a connected client, no entry carries an address.
+        let snapshot = reg.admin_snapshot(None);
+        assert!(snapshot.iter().all(|e| e.client_addr.is_none()));
+    }
+
+    #[test]
+    fn state_counts_by_state() {
+        let mut reg = SessionRegistry::new();
+        let a = reg.create_session(SessionToken::new("a"));
+        let b = reg.create_session(SessionToken::new("b"));
+        let _c = reg.create_session(SessionToken::new("c"));
+        reg.activate(a).unwrap();
+        reg.activate(b).unwrap();
+        reg.suspend(b).unwrap();
+
+        let counts = reg.state_counts();
+        assert_eq!(counts.creating, 1);
+        assert_eq!(counts.active, 1);
+        assert_eq!(counts.suspended, 1);
+        assert_eq!(counts.destroyed, 0);
     }
 
     #[test]

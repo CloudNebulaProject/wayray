@@ -95,6 +95,9 @@ pub enum NetToCompositor {
     /// the client to the server that owns its session.
     ClientConnected {
         hello: ClientHello,
+        /// Remote endpoint address of the connecting client (for admin
+        /// visibility; e.g. `wradm sessions`).
+        remote_addr: String,
         reply: mpsc::Sender<ConnectDecision>,
     },
     /// Client disconnected.
@@ -612,6 +615,7 @@ async fn serve_client(
     let connect_start = std::time::Instant::now();
     let _ = compositor_tx.send(NetToCompositor::ClientConnected {
         hello,
+        remote_addr: connection.remote_address().to_string(),
         reply: reply_tx,
     });
 
@@ -1218,7 +1222,7 @@ mod tests {
         let fake_compositor = std::thread::spawn(move || {
             loop {
                 match net_to_comp_rx.recv() {
-                    Ok(NetToCompositor::ClientConnected { hello, reply }) => {
+                    Ok(NetToCompositor::ClientConnected { hello, reply, .. }) => {
                         assert_eq!(hello.token.as_deref(), Some("session-token"));
                         reply
                             .send(ConnectDecision::Bind(SessionBinding {
