@@ -5,6 +5,12 @@
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+/// Upper bound on a single framed message. The length prefix is
+/// attacker-controlled on the wire; without a cap a hostile peer could make
+/// the receiver allocate up to 4 GiB from a 4-byte prefix. Generously above
+/// the largest legitimate message (an uncompressed 4K keyframe).
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum CodecError {
     #[error("serialization failed: {0}")]
@@ -12,6 +18,21 @@ pub enum CodecError {
 
     #[error("incomplete message: need {needed} bytes, have {available}")]
     Incomplete { needed: usize, available: usize },
+
+    #[error("message of {size} bytes exceeds the {max} byte limit")]
+    TooLarge { size: usize, max: usize },
+}
+
+/// Validate a wire length prefix against [`MAX_MESSAGE_SIZE`] before
+/// allocating a receive buffer for it.
+pub fn check_message_size(size: usize) -> Result<(), CodecError> {
+    if size > MAX_MESSAGE_SIZE {
+        return Err(CodecError::TooLarge {
+            size,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+    Ok(())
 }
 
 /// Encode a message to a length-prefixed byte vector.
