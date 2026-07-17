@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,6 +34,7 @@ use wayray_protocol::tls::verifier::PinPolicy;
 
 use crate::errors::WayRayError;
 use crate::handlers::ClientState;
+use crate::launcher_link::LauncherLink;
 use crate::network::{
     CompositorToNet, ConnectDecision, NetToCompositor, NetworkHandle, SessionBinding,
 };
@@ -83,6 +85,9 @@ struct CalloopData {
     /// Trust-on-first-use pin store for peer certificates, used when a peer has
     /// no fingerprint configured in `cluster.toml`.
     peer_pin_store: Arc<Mutex<PinStore>>,
+    /// Best-effort link to the session launcher (wrsessd); `None` unless
+    /// `--launcher-socket` was given.
+    launcher: Option<LauncherLink>,
 }
 
 /// Maximum wall-clock the compositor thread will spend probing peers for a
@@ -112,6 +117,7 @@ pub fn run(
     output: Output,
     net_handle: NetworkHandle,
     cluster: ClusterConfig,
+    launcher_socket: Option<PathBuf>,
 ) -> Result<()> {
     // Create the PixmanRenderer (CPU software renderer).
     let mut renderer = PixmanRenderer::new().map_err(|e| {
@@ -147,6 +153,12 @@ pub fn run(
     // SAFETY: This is called early in main before any other threads are spawned,
     // so there are no concurrent readers of the environment.
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+
+    // Optional session-launcher link: notify wrsessd of session lifecycle so
+    // it can spawn the greeter/desktop into this compositor. Best-effort — a
+    // missing or broken launcher never affects the compositor.
+    let launcher = launcher_socket
+        .map(|path| LauncherLink::start(path, socket_name.to_string_lossy().into_owned()));
 
     // Create the calloop event loop.
     let mut event_loop: EventLoop<CalloopData> =
@@ -235,6 +247,7 @@ pub fn run(
             PinStore::open(std::env::temp_dir().join("wayray-peer-known_hosts"))
                 .expect("temp pin store")
         }))),
+        launcher,
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -257,6 +270,16 @@ pub fn run(
             cleanup_counter = 0;
             let expired = calloop_data.session_registry.cleanup_expired();
             if !expired.is_empty() {
+                // Tell the launcher each destroyed session is gone so it can
+                // tear down the greeter/desktop processes. Must happen before
+                // the purge below removes the sessions (and their tokens).
+                if let Some(link) = &calloop_data.launcher {
+                    for id in &expired {
+                        if let Some(session) = calloop_data.session_registry.get(*id) {
+                            link.session_destroyed(session.token.0.clone(), id.raw());
+                        }
+                    }
+                }
                 calloop_data.session_registry.purge_destroyed();
             }
             // Drop stale cross-server affinity entries so we re-probe rather
@@ -389,6 +412,14 @@ fn drain_network_events(data: &mut CalloopData) {
                         let id = data.session_registry.create_session(token.clone());
                         if let Err(e) = data.session_registry.activate(id) {
                             warn!(error = %e, "failed to activate new session");
+                        }
+
+                        // Tell the session launcher (if linked) to prepare the
+                        // environment and start the greeter for this brand-new
+                        // session. Best-effort: delivery failures are logged by
+                        // the link worker and never affect the compositor.
+                        if let Some(link) = &data.launcher {
+                            link.session_created(token.0.clone());
                         }
                         (id, false)
                     }
