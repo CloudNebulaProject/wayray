@@ -1,0 +1,125 @@
+name: Release (beta)
+
+# Beta release pipeline: builds installable tarballs for Linux x86_64 and
+# illumos x86_64 (built on OpenIndiana, runs on OpenIndiana/OmniOS).
+#
+# - Tag push `v*` (e.g. v0.1.0-beta.1): builds and attaches the tarballs to a
+#   GitHub prerelease for that tag.
+# - workflow_dispatch: dry run — builds and uploads the tarballs as workflow
+#   artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux x86_64 tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe` versions the tarball.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libpixman-1-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --workspace --release --locked
+
+      - name: Package
+        run: sh packaging/package.sh linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayray-linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: dist/*.tar.gz
+
+  # Built inside an OpenIndiana VM so the artifact links against illumos
+  # libc/libraries; the resulting tarball installs on OpenIndiana and OmniOS.
+  # The client viewer (wrclient) is excluded — beta ships the server-side set.
+  illumos:
+    name: illumos x86_64 tarball (OpenIndiana)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build in OpenIndiana VM
+        uses: vmactions/openindiana-vm@v1
+        with:
+          usesh: true
+          mem: 8192
+          prepare: |
+            set -x
+            pkg publisher || true
+            # Show what's actually available so failures are diagnosable from logs.
+            pkg list -a | egrep -i 'wayland|pixman|xkbcommon|gcc-14|gcc-13|pkg-config' || true
+            pkg install -v developer/gcc-14 || pkg install -v developer/gcc-13 || true
+            pkg install -v developer/build/pkg-config || true
+            pkg install -v x11/library/libpixman || pkg install -v library/libpixman || true
+            pkg install -v x11/library/libxkbcommon || pkg install -v library/libxkbcommon || true
+            pkg install -v library/wayland || pkg install -v x11/library/wayland || true
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            export PATH="$HOME/.cargo/bin:/usr/gnu/bin:$PATH"
+            rustc --version
+            cargo --version
+            cargo build --release --locked \
+              -p wrsrvd -p wradm -p wrsessd -p wrlogin -p wr-wm-tiling \
+              --features wrsessd/doors
+            sh packaging/package.sh illumos-x86_64 wrsrvd wradm wrsessd wrlogin wr-wm-tiling
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayray-illumos-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: dist/*.tar.gz
