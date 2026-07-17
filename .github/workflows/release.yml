@@ -104,12 +104,12 @@ jobs:
             pkg install -v library/graphics/pixman x11/library/libxkbcommon || true
             # rustup-init (and rustc-built binaries) need 64-bit libgcc_s.so.1,
             # which OpenIndiana ships under /usr/gcc/<ver>/lib/amd64.
-            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:$LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:${LD_LIBRARY_PATH:-}"
             curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
           run: |
             set -e
             export PATH="$HOME/.cargo/bin:/usr/gnu/bin:$PATH"
-            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:$LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH="/usr/gcc/14/lib/amd64:${LD_LIBRARY_PATH:-}"
             rustc --version
             cargo --version
             cargo build --release --locked \
