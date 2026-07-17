@@ -43,6 +43,24 @@ pub fn send_request_sync(path: &Path, request: &LauncherRequest) -> io::Result<L
     }
 }
 
+/// Send a one-way notification: deliver `request` without waiting for a
+/// response line. Used for events the launcher never answers (e.g.
+/// `SessionLogout`), where a response read would block until the peer closes
+/// the connection.
+pub fn send_notification_sync(path: &Path, request: &LauncherRequest) -> io::Result<()> {
+    #[cfg(all(target_os = "illumos", feature = "doors"))]
+    {
+        // Doors are synchronous RPC; the call returns (possibly empty) response
+        // bytes which a notification simply ignores.
+        doors_transport::send_notification(path, request)
+    }
+
+    #[cfg(not(all(target_os = "illumos", feature = "doors")))]
+    {
+        unix_transport::send_json_notification(path, request)
+    }
+}
+
 /// Synchronous handler for launcher requests, shared by every server transport.
 ///
 /// Returning `None` means "no response" (e.g. a logout notification). Keeping
@@ -81,12 +99,20 @@ pub mod unix_transport {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
 
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+
     use crate::launcher::{LauncherRequest, LauncherResponse};
 
     use super::RequestHandler;
 
-    /// Send a request over a Unix socket and read the response.
-    pub fn send_request(path: &Path, request: &LauncherRequest) -> io::Result<LauncherResponse> {
+    /// Send any JSON-line request over a Unix socket and read one JSON-line
+    /// response. Generic core shared by the launcher and admin protocols.
+    pub fn send_json<Req, Resp>(path: &Path, request: &Req) -> io::Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
         let stream = UnixStream::connect(path)?;
         let mut writer = io::BufWriter::new(&stream);
         let mut reader = BufReader::new(&stream);
@@ -104,10 +130,38 @@ pub mod unix_transport {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    /// Send a JSON-line request without waiting for a response (fire-and-forget
+    /// notification). The connection is closed immediately after the write.
+    pub fn send_json_notification<Req: Serialize>(path: &Path, request: &Req) -> io::Result<()> {
+        let stream = UnixStream::connect(path)?;
+        let mut writer = io::BufWriter::new(&stream);
+
+        let mut json = serde_json::to_string(request)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        json.push('\n');
+        writer.write_all(json.as_bytes())?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Send a launcher request over a Unix socket and read the response.
+    pub fn send_request(path: &Path, request: &LauncherRequest) -> io::Result<LauncherResponse> {
+        send_json(path, request)
+    }
+
     /// Serve newline-delimited JSON requests over a Unix socket, dispatching
-    /// each to `handler`. Connections are handled sequentially (the launcher is
-    /// low-traffic); each request line yields at most one response line.
-    pub fn serve(path: &Path, mut handler: Box<dyn RequestHandler>) -> io::Result<()> {
+    /// each to `handler`. Connections are handled sequentially (these control
+    /// channels are low-traffic); each request line yields at most one
+    /// response line (`None` means "no response"). Generic core shared by the
+    /// launcher and admin protocols.
+    pub fn serve_json<Req, Resp>(
+        path: &Path,
+        mut handler: impl FnMut(Req) -> Option<Resp>,
+    ) -> io::Result<()>
+    where
+        Req: DeserializeOwned,
+        Resp: Serialize,
+    {
         // Remove any stale socket file from a previous run.
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
@@ -116,19 +170,32 @@ pub mod unix_transport {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to accept launcher connection");
+                    tracing::warn!(error = %e, "failed to accept control connection");
                     continue;
                 }
             };
-            if let Err(e) = serve_connection(&stream, handler.as_mut()) {
-                tracing::warn!(error = %e, "launcher connection ended with error");
+            if let Err(e) = serve_connection(&stream, &mut handler) {
+                tracing::warn!(error = %e, "control connection ended with error");
             }
         }
         Ok(())
     }
 
+    /// Serve launcher requests at `path`, dispatching to a boxed
+    /// [`RequestHandler`] (the same handler type the doors transport uses).
+    pub fn serve(path: &Path, mut handler: Box<dyn RequestHandler>) -> io::Result<()> {
+        serve_json(path, move |request| handler.handle(request))
+    }
+
     /// Handle one client connection: read request lines until EOF.
-    fn serve_connection(stream: &UnixStream, handler: &mut dyn RequestHandler) -> io::Result<()> {
+    fn serve_connection<Req, Resp>(
+        stream: &UnixStream,
+        handler: &mut impl FnMut(Req) -> Option<Resp>,
+    ) -> io::Result<()>
+    where
+        Req: DeserializeOwned,
+        Resp: Serialize,
+    {
         let mut reader = BufReader::new(stream);
         let mut writer = io::BufWriter::new(stream);
         let mut line = String::new();
@@ -136,9 +203,9 @@ pub mod unix_transport {
         while reader.read_line(&mut line)? > 0 {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                match serde_json::from_str::<LauncherRequest>(trimmed) {
+                match serde_json::from_str::<Req>(trimmed) {
                     Ok(request) => {
-                        if let Some(response) = handler.handle(request) {
+                        if let Some(response) = handler(request) {
                             let mut json = serde_json::to_string(&response)
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                             json.push('\n');
@@ -147,7 +214,7 @@ pub mod unix_transport {
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, line = trimmed, "failed to parse launcher request");
+                        tracing::error!(error = %e, line = trimmed, "failed to parse control request");
                     }
                 }
             }
@@ -188,6 +255,22 @@ pub mod doors_transport {
 
         serde_json::from_slice(&response_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Send a request via doors, discarding the (possibly empty) response.
+    /// Doors calls are always round trips, so a "notification" simply ignores
+    /// the returned bytes.
+    pub fn send_notification(path: &Path, request: &LauncherRequest) -> io::Result<()> {
+        let json = serde_json::to_vec(request)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let client = doors::Client::open(path)
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("{e:?}")))?;
+
+        client
+            .call_with_data(&json)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+        Ok(())
     }
 
     /// The door procedure is a plain function invoked by the doors thread pool
@@ -302,5 +385,116 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         drop(server); // detach; process exit reclaims the parked thread
+    }
+
+    /// Wait for a Unix socket file to appear (the server thread binds it).
+    fn wait_for_socket(path: &std::path::Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The generic JSON transport serves the admin protocol: a `serve_json`
+    /// handler answers `send_json` requests typed as AdminRequest/Response.
+    #[test]
+    fn generic_json_round_trip_with_admin_types() {
+        use crate::admin::{AdminRequest, AdminResponse, ServerStatus, SessionCounts};
+
+        let path = std::env::temp_dir().join(format!(
+            "wayray-admin-transport-test-{}.sock",
+            std::process::id()
+        ));
+        let server_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = unix_transport::serve_json::<AdminRequest, AdminResponse>(
+                &server_path,
+                |request| match request {
+                    AdminRequest::ServerStatus => Some(AdminResponse::ServerStatus(ServerStatus {
+                        version: "test".to_string(),
+                        uptime_secs: 42,
+                        sessions: SessionCounts::default(),
+                        cluster_peers: 0,
+                    })),
+                    AdminRequest::ListSessions => Some(AdminResponse::SessionList {
+                        sessions: Vec::new(),
+                    }),
+                },
+            );
+        });
+        wait_for_socket(&path);
+
+        let resp: AdminResponse =
+            unix_transport::send_json(&path, &AdminRequest::ServerStatus).expect("roundtrip");
+        match resp {
+            AdminResponse::ServerStatus(status) => assert_eq!(status.uptime_secs, 42),
+            other => panic!("expected ServerStatus, got {other:?}"),
+        }
+
+        let resp: AdminResponse =
+            unix_transport::send_json(&path, &AdminRequest::ListSessions).expect("roundtrip");
+        assert!(matches!(
+            resp,
+            AdminResponse::SessionList { sessions } if sessions.is_empty()
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A notification (no-response event like SessionLogout) is delivered to
+    /// the handler and the sender returns immediately without blocking on a
+    /// response read.
+    #[test]
+    fn notification_is_delivered_without_response() {
+        use std::sync::{Arc, Mutex};
+
+        let received: Arc<Mutex<Vec<LauncherRequest>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct Recorder(Arc<Mutex<Vec<LauncherRequest>>>);
+        impl RequestHandler for Recorder {
+            fn handle(&mut self, request: LauncherRequest) -> Option<LauncherResponse> {
+                self.0.lock().unwrap().push(request);
+                None
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "wayray-notify-transport-test-{}.sock",
+            std::process::id()
+        ));
+        let server_path = path.clone();
+        let server_received = received.clone();
+        std::thread::spawn(move || {
+            let _ = unix_transport::serve(&server_path, Box::new(Recorder(server_received)));
+        });
+        wait_for_socket(&path);
+
+        send_notification_sync(
+            &path,
+            &LauncherRequest::SessionLogout {
+                token: "tok-9".to_string(),
+                session_id: 9,
+            },
+        )
+        .expect("notification should send");
+
+        // The server processes the line asynchronously; poll for delivery.
+        let mut delivered = false;
+        for _ in 0..100 {
+            if !received.lock().unwrap().is_empty() {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(delivered, "notification never reached the handler");
+        assert!(matches!(
+            received.lock().unwrap()[0],
+            LauncherRequest::SessionLogout { session_id: 9, .. }
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
