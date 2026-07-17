@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -9,8 +10,11 @@ use smithay::{
         renderer::{
             Bind, Offscreen,
             damage::OutputDamageTracker,
-            element::texture::TextureRenderElement,
-            pixman::{PixmanRenderer, PixmanTexture},
+            element::{
+                Kind,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
+            },
+            pixman::PixmanRenderer,
         },
     },
     desktop::{Window, space::render_output},
@@ -20,7 +24,7 @@ use smithay::{
         calloop::{self, EventLoop},
         wayland_server::Display,
     },
-    utils::{Buffer as BufferCoord, Rectangle, Size},
+    utils::{Buffer as BufferCoord, Logical, Rectangle, Size},
     wayland::{compositor::CompositorClientState, socket::ListeningSocketSource},
 };
 use tracing::{info, warn};
@@ -38,6 +42,7 @@ use crate::network::{
 };
 use crate::session::{SessionLocation, SessionRegistry, SessionState, SessionToken};
 use crate::state::WayRay;
+use crate::wm::types::WindowId;
 
 /// Local load factor above which the server tries to shed *new* sessions to a
 /// less-loaded cluster peer. A guess pending deployment sizing.
@@ -83,6 +88,11 @@ struct CalloopData {
     /// Trust-on-first-use pin store for peer certificates, used when a peer has
     /// no fingerprint configured in `cluster.toml`.
     peer_pin_store: Arc<Mutex<PinStore>>,
+    /// Persistent solid-color buffers for server-side window borders
+    /// ([top, bottom, left, right] per window). Keeping them across frames
+    /// gives the damage tracker stable element ids, so unchanged borders
+    /// produce no damage.
+    border_buffers: HashMap<WindowId, [SolidColorBuffer; 4]>,
 }
 
 /// Maximum wall-clock the compositor thread will spend probing peers for a
@@ -235,6 +245,7 @@ pub fn run(
             PinStore::open(std::env::temp_dir().join("wayray-peer-known_hosts"))
                 .expect("temp pin store")
         }))),
+        border_buffers: HashMap::new(),
     };
 
     let running = Arc::new(AtomicBool::new(true));
@@ -656,48 +667,24 @@ fn render_headless_frame(data: &mut CalloopData) {
     // Apply WM render phase — positions/z-order before frame capture.
     // If an external WM is connected, trigger the render phase protocol
     // and apply its commands instead of the built-in WM's.
-    // Output name drives per-output workspace visibility. Computed once here so
-    // it can be used while `proto` is mutably borrowed below.
-    let output_name = data.state.output.name();
-    if let Some(proto) = &mut data.state.wm_state.protocol {
-        if proto.is_wm_connected() {
+    // Note: The external WM responds via protocol dispatch in the next
+    // display.dispatch_clients() call. For this frame, apply any commands
+    // accumulated from previous dispatches.
+    let external_commands = match data.state.wm_state.protocol.as_mut() {
+        Some(proto) if proto.is_wm_connected() => {
             proto.start_render_phase();
-            // Note: The external WM responds via protocol dispatch in the
-            // next display.dispatch_clients() call. For this frame, apply
-            // any commands accumulated from previous dispatches.
-            let commands = proto.take_render_commands();
-            // Snapshot workspace visibility per command id while `proto` is
-            // borrowed, then apply to the Space.
-            let resolved: Vec<_> = commands
-                .into_iter()
-                .map(|cmd| {
-                    let visible = cmd.visible && proto.workspace_visible(cmd.id, &output_name);
-                    (cmd, visible)
-                })
-                .collect();
-            for (cmd, visible) in resolved {
-                if let Some(window) = data
-                    .state
-                    .window_ids
-                    .iter()
-                    .find(|(id, _)| *id == cmd.id)
-                    .map(|(_, w)| w.clone())
-                {
-                    if visible {
-                        data.state.space.map_element(window, cmd.position, false);
-                    } else {
-                        data.state.space.unmap_elem(&window);
-                    }
-                }
-            }
-        } else {
-            data.state.apply_wm_render_commands();
+            Some(proto.take_render_commands())
         }
-    } else {
-        data.state.apply_wm_render_commands();
+        _ => None,
+    };
+    match external_commands {
+        Some(commands) => data.state.apply_render_commands(commands),
+        None => data.state.apply_wm_render_commands(),
     }
 
-    let custom_elements: &[TextureRenderElement<PixmanTexture>] = &[];
+    // Server-side window borders requested by the WM via set_borders, drawn
+    // as four solid-color rects around each bordered window's geometry.
+    let custom_elements = collect_border_elements(&data.state, &mut data.border_buffers);
 
     let render_result = render_output::<_, _, Window, _>(
         &output,
@@ -710,7 +697,7 @@ fn render_headless_frame(data: &mut CalloopData) {
         // checksum/keyframe recovery keep it correct if a delta is ever missed.
         1,
         [&data.state.space],
-        custom_elements,
+        custom_elements.as_slice(),
         &mut data.damage_tracker,
         CLEAR_COLOR,
     );
@@ -751,6 +738,69 @@ fn render_headless_frame(data: &mut CalloopData) {
             warn!(?err, "headless damage tracker render failed");
         }
     }
+}
+
+/// Compute the four border rectangles surrounding a window geometry, in the
+/// order [top, bottom, left, right]. The bars sit outside the geometry: top
+/// and bottom span the full bordered width (including the corners), left and
+/// right fill the sides between them.
+fn border_rects(geometry: Rectangle<i32, Logical>, width: i32) -> [Rectangle<i32, Logical>; 4] {
+    let w = width.max(0);
+    let (x, y) = (geometry.loc.x, geometry.loc.y);
+    let (gw, gh) = (geometry.size.w, geometry.size.h);
+    [
+        // Top bar.
+        Rectangle::new((x - w, y - w).into(), (gw + 2 * w, w).into()),
+        // Bottom bar.
+        Rectangle::new((x - w, y + gh).into(), (gw + 2 * w, w).into()),
+        // Left bar.
+        Rectangle::new((x - w, y).into(), (w, gh).into()),
+        // Right bar.
+        Rectangle::new((x + gw, y).into(), (w, gh).into()),
+    ]
+}
+
+/// Build the solid-color render elements for all bordered, mapped windows.
+///
+/// Reuses the per-window [`SolidColorBuffer`]s in `border_buffers` so element
+/// ids stay stable across frames and unchanged borders produce no damage;
+/// buffers of windows whose border was removed are dropped so the damage
+/// tracker sees them disappear.
+fn collect_border_elements(
+    state: &WayRay,
+    border_buffers: &mut HashMap<WindowId, [SolidColorBuffer; 4]>,
+) -> Vec<SolidColorRenderElement> {
+    let Some(proto) = state.wm_state.protocol.as_ref() else {
+        border_buffers.clear();
+        return Vec::new();
+    };
+    let borders = proto.borders();
+    border_buffers.retain(|id, _| borders.contains_key(id));
+
+    let mut elements = Vec::new();
+    for (id, window) in &state.window_ids {
+        let Some(spec) = borders.get(id) else {
+            continue;
+        };
+        // Unmapped (hidden) windows draw no borders.
+        let Some(geometry) = state.space.element_geometry(window) else {
+            continue;
+        };
+        let buffers = border_buffers
+            .entry(*id)
+            .or_insert_with(|| std::array::from_fn(|_| SolidColorBuffer::default()));
+        for (buffer, rect) in buffers.iter_mut().zip(border_rects(geometry, spec.width)) {
+            buffer.update(rect.size, spec.color_f32());
+            elements.push(SolidColorRenderElement::from_buffer(
+                buffer,
+                rect.loc.to_physical(1),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            ));
+        }
+    }
+    elements
 }
 
 /// Maximum delta frames between keyframes. A keyframe resends the whole frame,
@@ -883,7 +933,52 @@ fn ctrlc_handler(running: &Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerLoad, select_least_loaded_peer};
+    use smithay::utils::{Logical, Rectangle};
+
+    use super::{PeerLoad, border_rects, select_least_loaded_peer};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn border_rects_surround_geometry() {
+        // A 100x50 window at (10, 20) with a 3px border.
+        let [top, bottom, left, right] = border_rects(rect(10, 20, 100, 50), 3);
+
+        // Top and bottom bars span the corners.
+        assert_eq!(top, rect(7, 17, 106, 3));
+        assert_eq!(bottom, rect(7, 70, 106, 3));
+        // Left and right bars fill the sides between them.
+        assert_eq!(left, rect(7, 20, 3, 50));
+        assert_eq!(right, rect(110, 20, 3, 50));
+
+        // The bars never overlap the window geometry itself.
+        for bar in [top, bottom, left, right] {
+            assert!(
+                bar.intersection(rect(10, 20, 100, 50)).is_none(),
+                "{bar:?} overlaps the window"
+            );
+        }
+    }
+
+    #[test]
+    fn border_rects_at_origin_extend_offscreen() {
+        // A window flush with the output corner: the bars go negative and are
+        // clipped by the damage tracker, not by us.
+        let [top, _, left, _] = border_rects(rect(0, 0, 10, 10), 2);
+        assert_eq!(top, rect(-2, -2, 14, 2));
+        assert_eq!(left, rect(-2, 0, 2, 10));
+    }
+
+    #[test]
+    fn border_rects_zero_width_is_empty() {
+        // Defensive: specs are validated to width > 0, but a zero width must
+        // not produce inverted rectangles.
+        for bar in border_rects(rect(5, 5, 20, 20), 0) {
+            assert!(bar.size.w == 0 || bar.size.h == 0);
+        }
+    }
 
     #[test]
     fn no_candidates_is_none() {

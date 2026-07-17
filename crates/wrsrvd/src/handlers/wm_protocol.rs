@@ -39,6 +39,16 @@ impl WmProtocolHandler for WayRay {
             .collect()
     }
 
+    fn outputs(&self) -> Vec<(String, i32, i32)> {
+        // Single virtual output today; multi-output support will extend this.
+        let size = self
+            .output
+            .current_mode()
+            .map(|mode| mode.size)
+            .unwrap_or_default();
+        vec![(self.output.name(), size.w, size.h)]
+    }
+
     fn configure_window(&mut self, id: crate::wm::types::WindowId, width: i32, height: i32) {
         let Some(window) = self.window_for_id(id).cloned() else {
             warn!(?id, "configure_window: unknown window");
