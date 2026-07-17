@@ -102,7 +102,10 @@ mod tests {
 
         let mut framebuffer = vec![0xAAu8; stride * height as usize];
         apply_region(&mut framebuffer, stride, &region);
-        assert_eq!(framebuffer, pixels, "absolute region copy must reproduce source");
+        assert_eq!(
+            framebuffer, pixels,
+            "absolute region copy must reproduce source"
+        );
 
         // Re-applying is idempotent (a copy, not an accumulating XOR).
         apply_region(&mut framebuffer, stride, &region);

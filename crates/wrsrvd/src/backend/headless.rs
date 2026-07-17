@@ -125,6 +125,19 @@ fn peer_pin_policy(data: &CalloopData, server_id: &str, addr: &str) -> PinPolicy
     }
 }
 
+/// Optional integration points for the headless backend, all disabled by
+/// default: session persistence, the session-launcher link, and the admin
+/// control socket.
+#[derive(Default)]
+pub struct HeadlessOptions {
+    /// SQLite session-persistence database path (`--state-db`).
+    pub state_db: Option<PathBuf>,
+    /// Session-launcher socket path (`--launcher-socket`).
+    pub launcher_socket: Option<PathBuf>,
+    /// Admin control socket path (`--admin-socket`).
+    pub admin_socket: Option<PathBuf>,
+}
+
 /// Run the compositor with the headless PixmanRenderer backend.
 ///
 /// This creates a CPU-only software renderer suitable for headless servers
@@ -135,10 +148,13 @@ pub fn run(
     output: Output,
     net_handle: NetworkHandle,
     cluster: ClusterConfig,
-    state_db: Option<PathBuf>,
-    launcher_socket: Option<PathBuf>,
-    admin_socket: Option<PathBuf>,
+    options: HeadlessOptions,
 ) -> Result<()> {
+    let HeadlessOptions {
+        state_db,
+        launcher_socket,
+        admin_socket,
+    } = options;
     // Create the PixmanRenderer (CPU software renderer).
     let mut renderer = PixmanRenderer::new().map_err(|e| {
         WayRayError::BackendInit(Box::<dyn std::error::Error + Send + Sync>::from(
@@ -261,6 +277,11 @@ pub fn run(
         None
     };
 
+    // Give the compositor state a path to the network thread so selection
+    // changes made by Wayland apps can be forwarded to the remote client
+    // (server→client clipboard sync).
+    state.clipboard_tx = Some(net_handle.tx.clone());
+
     let mut calloop_data = CalloopData {
         state,
         display,
@@ -339,6 +360,10 @@ pub fn run(
             .display
             .flush_clients()
             .map_err(|e| WayRayError::EventLoop(Box::new(e)))?;
+
+        // Forward any selection a Wayland app set during dispatch to the
+        // remote client (deferred one turn; see `process_pending_clipboard`).
+        calloop_data.state.process_pending_clipboard();
 
         // Dispatch calloop sources (timer + Wayland socket) with ~16ms timeout.
         event_loop
@@ -533,15 +558,29 @@ fn drain_network_events(data: &mut CalloopData) {
                 publish_cluster_state(data);
             }
             Ok(NetToCompositor::Control(ctrl)) => {
-                tracing::debug!(?ctrl, "received control message");
-                // A client that detected drift (checksum mismatch) asks for a
-                // full frame to resynchronize.
-                if matches!(
-                    ctrl,
-                    wayray_protocol::messages::ControlMessage::RequestKeyframe
-                ) {
-                    info!("client requested keyframe (resync)");
-                    data.force_keyframe = true;
+                use wayray_protocol::messages::ControlMessage;
+                match ctrl {
+                    // A client that detected drift (checksum mismatch) asks
+                    // for a full frame to resynchronize.
+                    ControlMessage::RequestKeyframe => {
+                        info!("client requested keyframe (resync)");
+                        data.force_keyframe = true;
+                    }
+                    // The client pushed its local OS clipboard (captured on
+                    // focus gain); re-offer it as the Wayland selection so
+                    // apps in the session can paste it.
+                    ControlMessage::ClipboardData(clip) => {
+                        let dh = data.display.handle();
+                        data.state.set_remote_clipboard(&dh, clip);
+                    }
+                    ControlMessage::ClipboardOffer(offer) => {
+                        // Informational; data follows in ClipboardData.
+                        tracing::debug!(mime_types = ?offer.mime_types, "client clipboard offer");
+                    }
+                    // Never log other messages with their payloads wholesale:
+                    // FrameAck/Pong are noise, and future variants may carry
+                    // user data.
+                    other => tracing::debug!(?other, "received control message"),
                 }
             }
             Err(TryRecvError::Empty) => break,

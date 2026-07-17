@@ -71,27 +71,25 @@ pub fn convert_keyboard(event: &winit::event::KeyEvent, real_shift: bool) -> Vec
     // press with a temporary Shift toggle so the compositor (which holds no
     // caps lock) still produces the right case, then restore Shift to the
     // physical state so held-Shift shortcuts are unaffected.
-    if pressed {
-        if let Some(text) = event.text.as_ref() {
-            let mut chars = text.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                if c.is_ascii_alphabetic() {
-                    let want_upper = c.is_ascii_uppercase();
-                    if want_upper != real_shift {
-                        let shift = |down: bool| {
-                            InputMessage::Keyboard(KeyboardEvent {
-                                keycode: KEY_LEFTSHIFT,
-                                state: if down {
-                                    KeyState::Pressed
-                                } else {
-                                    KeyState::Released
-                                },
-                                time: 0,
-                            })
-                        };
-                        return vec![shift(want_upper), key, shift(real_shift)];
-                    }
-                }
+    if pressed && let Some(text) = event.text.as_ref() {
+        let mut chars = text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next())
+            && c.is_ascii_alphabetic()
+        {
+            let want_upper = c.is_ascii_uppercase();
+            if want_upper != real_shift {
+                let shift = |down: bool| {
+                    InputMessage::Keyboard(KeyboardEvent {
+                        keycode: KEY_LEFTSHIFT,
+                        state: if down {
+                            KeyState::Pressed
+                        } else {
+                            KeyState::Released
+                        },
+                        time: 0,
+                    })
+                };
+                return vec![shift(want_upper), key, shift(real_shift)];
             }
         }
     }

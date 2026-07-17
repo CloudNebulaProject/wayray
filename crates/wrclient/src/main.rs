@@ -4,6 +4,7 @@
 //! and renders them in a native window using wgpu. Input events are
 //! captured and will be forwarded to the server in a future task.
 
+pub mod clipboard;
 pub mod display;
 pub mod input;
 pub mod network;
@@ -19,10 +20,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use wayray_protocol::messages::InputMessage;
+use wayray_protocol::messages::{AudioMessage, ControlMessage, InputMessage, caps};
 
+use crate::clipboard::LocalClipboard;
 use crate::display::Display;
-use crate::network::ClientConfig;
+use crate::network::{ClientConfig, ConnectError};
 
 /// Frame data sent from the network thread to the render thread.
 pub struct FrameData {
@@ -39,6 +41,9 @@ struct App {
     frame_rx: mpsc::Receiver<FrameData>,
     /// Sender for input events to the network thread.
     input_tx: mpsc::Sender<InputMessage>,
+    /// Notifies the network thread that the window gained focus, so it can
+    /// poll the local OS clipboard and push changes to the server.
+    focus_tx: mpsc::Sender<()>,
     /// Display state, created once the window is available.
     display: Option<Display>,
     /// The window reference.
@@ -57,12 +62,14 @@ impl App {
         height: u32,
         frame_rx: mpsc::Receiver<FrameData>,
         input_tx: mpsc::Sender<InputMessage>,
+        focus_tx: mpsc::Sender<()>,
     ) -> Self {
         Self {
             width,
             height,
             frame_rx,
             input_tx,
+            focus_tx,
             display: None,
             window: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -217,6 +224,12 @@ impl ApplicationHandler for App {
                     self.send_input(msg);
                 }
             }
+            WindowEvent::Focused(true) => {
+                // The user is switching into the session — the moment a fresh
+                // local copy would be brought along. Let the network thread
+                // poll the OS clipboard and sync any change to the server.
+                let _ = self.focus_tx.send(());
+            }
             _ => {}
         }
     }
@@ -237,9 +250,37 @@ enum SessionEnd {
     Disconnected,
 }
 
+/// Handle a control message forwarded by the control-reader task.
+async fn handle_control_message(
+    conn: &mut network::ServerConnection,
+    clipboard: &mut LocalClipboard,
+    msg: ControlMessage,
+) {
+    match msg {
+        ControlMessage::Ping(ping) => {
+            if let Err(e) = conn.send_pong(ping.timestamp).await {
+                warn!(error = %e, "failed to answer ping");
+            }
+        }
+        ControlMessage::ClipboardOffer(offer) => {
+            tracing::debug!(mime_types = ?offer.mime_types, "server clipboard offer");
+        }
+        ControlMessage::ClipboardData(clip) => {
+            clipboard.apply_remote(&clip);
+        }
+        ControlMessage::SessionEvent(event) => {
+            info!(?event, "session event from server");
+        }
+        other => {
+            tracing::debug!(?other, "unhandled control message");
+        }
+    }
+}
+
 /// Run one connection's frame-receive / input-forward loop until the stream
 /// errors (returns [`SessionEnd::Disconnected`]) or the render thread closes
 /// (returns [`SessionEnd::RenderThreadClosed`]).
+#[allow(clippy::too_many_arguments)]
 async fn run_session_loop(
     conn: &mut network::ServerConnection,
     display_recv: &mut quinn::RecvStream,
@@ -248,7 +289,13 @@ async fn run_session_loop(
     input_rx: &mpsc::Receiver<InputMessage>,
     frame_tx: &mpsc::Sender<FrameData>,
     proxy: &EventLoopProxy<()>,
+    ctrl_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
+    focus_rx: &mpsc::Receiver<()>,
+    clipboard: &mut LocalClipboard,
 ) -> SessionEnd {
+    // Clipboard control messages may only be sent to servers that understand
+    // them (protocol v2+); older servers would hit a decode error and drop us.
+    let clipboard_supported = conn.server_hello.version >= 2;
     // True while we've asked for a keyframe and are waiting for the resync, so
     // we don't flood the server with requests every frame during the round-trip.
     let mut keyframe_pending = false;
@@ -257,6 +304,25 @@ async fn run_session_loop(
         while let Ok(input_msg) = input_rx.try_recv() {
             if let Err(e) = conn.send_input(&input_msg).await {
                 warn!(error = %e, "failed to send input, reconnecting");
+                return SessionEnd::Disconnected;
+            }
+        }
+
+        // Drain control messages surfaced by the control-reader task
+        // (clipboard sync, pings, session events).
+        while let Ok(msg) = ctrl_rx.try_recv() {
+            handle_control_message(conn, clipboard, msg).await;
+        }
+
+        // On focus gain, poll the local OS clipboard and push a change to the
+        // server. Multiple queued focus events collapse into one poll.
+        if focus_rx.try_iter().count() > 0
+            && clipboard_supported
+            && let Some(clip) = clipboard.capture_if_changed()
+        {
+            let msg = ControlMessage::ClipboardData(clip);
+            if let Err(e) = conn.send_control(&msg).await {
+                warn!(error = %e, "failed to send clipboard, reconnecting");
                 return SessionEnd::Disconnected;
             }
         }
@@ -286,7 +352,8 @@ async fn run_session_loop(
                 // mismatch means a frame was missed/reordered and left a region
                 // stale; ask for a keyframe to resync (once, until it lands).
                 let height = framebuffer.len() / stride;
-                let local = wayray_protocol::encoding::checksum(framebuffer, stride, stride, height);
+                let local =
+                    wayray_protocol::encoding::checksum(framebuffer, stride, stride, height);
                 if local != update.checksum {
                     if !keyframe_pending {
                         warn!(
@@ -332,6 +399,67 @@ async fn run_session_loop(
     }
 }
 
+/// Own the control receive stream and forward every message to the session
+/// loop over a channel. Ends when the stream errors (connection closed) or
+/// the session loop drops the receiver.
+async fn control_reader_loop(
+    mut recv: quinn::RecvStream,
+    tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
+) {
+    loop {
+        match network::read_control_message(&mut recv).await {
+            Ok(msg) => {
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "control reader ending");
+                return;
+            }
+        }
+    }
+}
+
+/// Accept the dedicated audio stream and drain it. No playback backend exists
+/// yet, so chunks are discarded with a trace log — this keeps the wire
+/// protocol and stream plumbing exercised so a backend can drop in later.
+async fn audio_loop(connection: quinn::Connection) {
+    // The audio stream is the only server-initiated bidirectional stream. If
+    // the server never opens one (old server, capability ignored), this
+    // pends until the connection closes — which is fine.
+    let Ok((_audio_send, mut recv)) = connection.accept_bi().await else {
+        return;
+    };
+    info!("audio stream accepted");
+    loop {
+        match network::read_audio_message(&mut recv).await {
+            Ok(AudioMessage::Start(start)) => {
+                info!(
+                    sample_rate = start.sample_rate,
+                    channels = start.channels,
+                    codec = ?start.codec,
+                    "audio stream declared (no playback backend; chunks are discarded)"
+                );
+            }
+            Ok(AudioMessage::Chunk(chunk)) => {
+                tracing::trace!(
+                    pts_micros = chunk.pts_micros,
+                    bytes = chunk.payload.len(),
+                    "discarding audio chunk (no playback backend)"
+                );
+            }
+            Ok(AudioMessage::Stop) => {
+                info!("audio stream stopped");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "audio stream ended");
+                return;
+            }
+        }
+    }
+}
+
 /// Maximum number of redirect hops before giving up (loop guard).
 const MAX_REDIRECTS: u32 = 3;
 
@@ -339,8 +467,10 @@ const MAX_REDIRECTS: u32 = 3;
 enum ConnectResult {
     /// Connected to a server; streams ready. Boxed to keep the enum small.
     Connected(Box<(quinn::Endpoint, network::ServerConnection)>),
-    /// Connection failed on the very first attempt — the client should give up.
-    FatalFirstAttempt,
+    /// Connection failed for good — either a typed rejection from the server
+    /// (retrying is pointless) or a total failure on the very first attempt.
+    /// The error is surfaced to the user as a miette diagnostic.
+    Fatal(ConnectError),
     /// Connection failed; the caller should back off and retry.
     Retry,
 }
@@ -363,7 +493,7 @@ async fn connect_following_redirects(
     pin_store: &Arc<Mutex<network::PinStore>>,
     allowed: &HashMap<SocketAddr, Candidate>,
 ) -> ConnectResult {
-    let mut last_error: Option<String> = None;
+    let mut last_error: Option<ConnectError> = None;
 
     for (cand_idx, candidate) in candidates.iter().enumerate() {
         // Each candidate gets its own redirect chain.
@@ -373,7 +503,11 @@ async fn connect_following_redirects(
             let config = ClientConfig {
                 server_addr: hop_target.addr,
                 server_name: hop_target.name.clone(),
-                capabilities: vec!["display".to_string()],
+                capabilities: vec![
+                    caps::DISPLAY.to_string(),
+                    caps::CLIPBOARD.to_string(),
+                    caps::AUDIO.to_string(),
+                ],
                 token: token.clone(),
                 expected_fingerprint: hop_target.fingerprint.clone(),
                 pin_store: pin_store.clone(),
@@ -418,8 +552,14 @@ async fn connect_following_redirects(
                     }
                 }
                 Err(e) => {
-                    last_error = Some(e.to_string());
+                    // A typed rejection (version mismatch etc.) is policy, not
+                    // a transient fault — retrying or trying other candidates
+                    // with the same client is pointless. Surface it directly.
+                    if e.is_fatal() {
+                        return ConnectResult::Fatal(e);
+                    }
                     warn!(candidate = cand_idx, error = %e, "connection attempt failed");
+                    last_error = Some(e);
                     break; // try the next candidate
                 }
             }
@@ -427,8 +567,9 @@ async fn connect_following_redirects(
     }
 
     if first_attempt {
-        error!(error = ?last_error, "failed to connect to any candidate server");
-        return ConnectResult::FatalFirstAttempt;
+        return ConnectResult::Fatal(last_error.unwrap_or_else(|| {
+            ConnectError::Transport("no candidate servers could be tried".to_string())
+        }));
     }
     ConnectResult::Retry
 }
@@ -615,6 +756,7 @@ fn main() {
 
     let (frame_tx, frame_rx) = mpsc::channel::<FrameData>();
     let (input_tx, input_rx) = mpsc::channel::<InputMessage>();
+    let (focus_tx, focus_rx) = mpsc::channel::<()>();
 
     // Use a std::sync::mpsc oneshot pattern: the network thread sends
     // dimensions back before entering its frame-receive loop.
@@ -645,6 +787,10 @@ fn main() {
                 let mut dims_reported = false;
                 let mut first_attempt = true;
 
+                // The OS clipboard handle lives across reconnects so the echo
+                // suppression state (last observed text) survives a resume.
+                let mut clipboard = LocalClipboard::new();
+
                 loop {
                     // Time from the start of a reconnect attempt to ServerHello.
                     let attempt_start = std::time::Instant::now();
@@ -665,9 +811,16 @@ fn main() {
                             let (ep, conn) = *boxed;
                             (ep, conn)
                         }
-                        ConnectResult::FatalFirstAttempt => {
-                            // Unblock the main thread on the very first try.
-                            let _ = dim_tx.send((0, 0));
+                        ConnectResult::Fatal(err) => {
+                            // Render the full miette diagnostic (message, code
+                            // and help) so e.g. a protocol-version rejection
+                            // tells the user exactly what to do.
+                            error!("giving up on connecting: {err}");
+                            eprintln!("{:?}", miette::Report::new(err));
+                            if !dims_reported {
+                                // Unblock the main thread waiting on dims.
+                                let _ = dim_tx.send((0, 0));
+                            }
                             return;
                         }
                         ConnectResult::Retry => {
@@ -733,11 +886,33 @@ fn main() {
                         dims_reported = true;
                     }
 
+                    // Hand the control receive stream to a dedicated reader
+                    // task: length-prefixed reads are not cancellation-safe,
+                    // so they must not be raced against a timeout in the
+                    // session select loop. Messages surface via a channel
+                    // drained there.
+                    let (ctrl_tx, mut ctrl_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
+                    let control_task = conn
+                        .take_control_recv()
+                        .map(|recv| tokio::spawn(control_reader_loop(recv, ctrl_tx)));
+
+                    // Accept the dedicated audio stream (the only
+                    // server-initiated bidi stream) in the background. Opened
+                    // by the server only because we advertised the audio
+                    // capability; protocol plumbing only — chunks are
+                    // discarded until a playback backend exists.
+                    let audio_task = tokio::spawn(audio_loop(conn.connection.clone()));
+
                     // Accept the display stream from the server.
                     let mut display_recv = match conn.accept_display_stream().await {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(error = %e, "failed to accept display stream, reconnecting");
+                            audio_task.abort();
+                            if let Some(t) = control_task {
+                                t.abort();
+                            }
                             continue;
                         }
                     };
@@ -759,8 +934,18 @@ fn main() {
                         &input_rx,
                         &frame_tx,
                         &proxy,
+                        &mut ctrl_rx,
+                        &focus_rx,
+                        &mut clipboard,
                     )
                     .await;
+
+                    // The background tasks hold streams of the connection we
+                    // are about to drop; end them deterministically.
+                    audio_task.abort();
+                    if let Some(t) = control_task {
+                        t.abort();
+                    }
 
                     match disconnected {
                         SessionEnd::RenderThreadClosed => {
@@ -792,6 +977,6 @@ fn main() {
     // Run the winit event loop on the main thread.
     // The event loop was created earlier (before spawning the network thread)
     // so we could pass an EventLoopProxy to wake it on new frames.
-    let mut app = App::new(width, height, frame_rx, input_tx);
+    let mut app = App::new(width, height, frame_rx, input_tx, focus_tx);
     event_loop.run_app(&mut app).expect("event loop error");
 }

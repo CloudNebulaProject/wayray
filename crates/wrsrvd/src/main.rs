@@ -170,8 +170,10 @@ fn main() -> Result<()> {
         output,
         net_handle,
         cluster,
-        state_db,
-        launcher_socket,
-        admin_socket,
+        backend::headless::HeadlessOptions {
+            state_db,
+            launcher_socket,
+            admin_socket,
+        },
     )
 }
