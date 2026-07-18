@@ -14,7 +14,10 @@ PLATFORM="${1:?usage: package.sh <platform-label> [binary...]}"
 shift || true
 BINS="${*:-wrsrvd wrclient wradm wrsessd wrlogin wr-wm-tiling}"
 
-VERSION="$(git describe --tags --always 2>/dev/null || echo 0.1.0-dev)"
+# Version precedence: explicit WAYRAY_VERSION (set by the release workflow
+# from the tag — the OpenIndiana VM has no git, so `git describe` can't work
+# there), then git describe, then a dev fallback.
+VERSION="${WAYRAY_VERSION:-$(git describe --tags --always 2>/dev/null || echo 0.1.0-dev)}"
 # Strip a leading v so tarballs read wayray-0.1.0-beta.1-... not wayray-v0.1.0.
 VERSION="${VERSION#v}"
 
