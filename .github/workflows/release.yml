@@ -62,7 +62,9 @@ jobs:
         run: cargo build --workspace --release --locked
 
       - name: Package
-        run: sh packaging/package.sh linux-x86_64
+        run: |
+          export WAYRAY_VERSION="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}"
+          sh packaging/package.sh linux-x86_64
 
       - uses: actions/upload-artifact@v4
         with:
@@ -99,7 +101,7 @@ jobs:
             pkg publisher || true
             pkg install -v developer/gcc-14 developer/build/pkg-config || true
             # No system libwayland needed: the vendored wayland-backend uses its
-            # pure-Rust backend (with the illumos epoll shim). pixman + xkbcommon
+            # pure-Rust backend (native event ports on illumos). pixman + xkbcommon
             # are runtime/link deps of the smithay renderer and keyboard handling.
             pkg install -v library/graphics/pixman x11/library/libxkbcommon || true
             # rustup-init (and rustc-built binaries) need 64-bit libgcc_s.so.1,
@@ -115,6 +117,9 @@ jobs:
             cargo build --release --locked \
               -p wrsrvd -p wradm -p wrsessd -p wrlogin -p wr-wm-tiling \
               --features wrsessd/doors
+            # The VM has no git, so pass the version explicitly (empty on
+            # non-tag runs; package.sh then falls back to git describe/dev).
+            export WAYRAY_VERSION="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}"
             sh packaging/package.sh illumos-x86_64 wrsrvd wradm wrsessd wrlogin wr-wm-tiling
 
       - uses: actions/upload-artifact@v4
